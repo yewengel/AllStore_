@@ -3,34 +3,19 @@ const PaymentSetting = require('../models/PaymentSetting');
 const { getPaymentConfiguration } = require('./chapa');
 
 // Methods an administrator can enable/disable from the payment settings page.
-const PAYMENT_METHOD_KEYS = ['Telebirr', 'M-Pesa', 'Visa', 'Mastercard', 'Bank Transfer', 'Cash on Delivery'];
-
-// Keywords used to match gateway-advertised method labels to our display methods.
-const GATEWAY_KEYWORDS = {
-  Telebirr: ['telebirr'],
-  'M-Pesa': ['m-pesa', 'mpesa', 'm_pesa', 'm pesa'],
-  Visa: ['visa'],
-  Mastercard: ['mastercard', 'master card', 'master-card'],
-};
+const PAYMENT_METHOD_KEYS = ['Bank Transfer', 'Telebirr', 'CBE Birr'];
 
 /**
- * Load the singleton payment settings document. Returns null when MongoDB is
- * not connected (for example, in isolated unit tests) so callers can safely
- * fall back to environment-only configuration.
+ * Read the singleton payment settings document without making public checkout
+ * requests create or modify settings.
  */
 const getPaymentSettings = async () => {
   if (mongoose.connection.readyState !== 1) return null;
-  return PaymentSetting.findOneAndUpdate(
-    { key: 'payment' },
-    { $setOnInsert: { key: 'payment' } },
-    { new: true, upsert: true, setDefaultsOnInsert: true }
-  ).lean();
+  return PaymentSetting.findOne({ key: 'payment' }).lean();
 };
 
 /**
- * Merge environment gateway configuration with administrator settings.
- * methodSupported = configuration/gateway allows the method at all.
- * methodEnabled   = supported and not disabled by an administrator.
+ * Resolve only payment methods with complete administrator-entered details.
  */
 const resolvePaymentConfiguration = async () => {
   const base = getPaymentConfiguration();
@@ -39,34 +24,31 @@ const resolvePaymentConfiguration = async () => {
     (settings?.disabledMethods || []).filter((method) => PAYMENT_METHOD_KEYS.includes(method))
   );
 
-  const gatewaySupports = (method) => {
-    if (!base.chapa.configured) return false;
-    const available = base.chapa.availableMethods;
-    if (!Array.isArray(available) || available.length === 0) return true;
-    return available.some((label) => {
-      const normalized = String(label).toLowerCase();
-      return GATEWAY_KEYWORDS[method].some((keyword) => normalized.includes(keyword));
-    });
-  };
-
   const bankTransfer = {
-    bankName: settings?.bankTransfer?.bankName?.trim() || base.bankTransfer.bankName,
-    accountName: settings?.bankTransfer?.accountName?.trim() || base.bankTransfer.accountName,
-    accountNumber: settings?.bankTransfer?.accountNumber?.trim() || base.bankTransfer.accountNumber,
-    branch: settings?.bankTransfer?.branch?.trim() || base.bankTransfer.branch,
+    bankName: settings?.bankTransfer?.bankName?.trim() || '',
+    accountName: settings?.bankTransfer?.accountName?.trim() || '',
+    accountNumber: settings?.bankTransfer?.accountNumber?.trim() || '',
+    branch: settings?.bankTransfer?.branch?.trim() || '',
     instructions: settings?.bankTransfer?.instructions?.trim() || '',
   };
   const bankTransferConfigured = Boolean(
     bankTransfer.bankName && bankTransfer.accountName && bankTransfer.accountNumber
   );
+  const telebirr = {
+    businessName: settings?.telebirr?.businessName?.trim() || '',
+    accountDetails: settings?.telebirr?.accountDetails?.trim() || '',
+    instructions: settings?.telebirr?.instructions?.trim() || '',
+  };
+  const cbeBirr = {
+    accountName: settings?.cbeBirr?.accountName?.trim() || '',
+    accountDetails: settings?.cbeBirr?.accountDetails?.trim() || '',
+    instructions: settings?.cbeBirr?.instructions?.trim() || '',
+  };
 
   const methodSupported = {
-    Telebirr: gatewaySupports('Telebirr'),
-    'M-Pesa': gatewaySupports('M-Pesa'),
-    Visa: gatewaySupports('Visa'),
-    Mastercard: gatewaySupports('Mastercard'),
+    Telebirr: Boolean(telebirr.businessName && telebirr.accountDetails),
+    'CBE Birr': Boolean(cbeBirr.accountName && cbeBirr.accountDetails),
     'Bank Transfer': bankTransferConfigured,
-    'Cash on Delivery': true,
   };
 
   const methodEnabled = Object.fromEntries(
@@ -85,6 +67,8 @@ const resolvePaymentConfiguration = async () => {
       availableMethods: base.chapa.configured ? base.chapa.availableMethods : [],
     },
     bankTransfer: { ...bankTransfer, configured: bankTransferConfigured },
+    telebirr: { ...telebirr, configured: methodSupported.Telebirr },
+    cbeBirr: { ...cbeBirr, configured: methodSupported['CBE Birr'] },
     disabledMethods: [...disabled],
     methodSupported,
     methodEnabled,

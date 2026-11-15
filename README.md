@@ -47,14 +47,15 @@
   * `admin`: Verifies `req.user.role === 'admin'`. Returns `403 Forbidden` if a customer attempts unauthorized access.
 
 ### B. Product Management (Admin)
-* Admins can create new products with: `name`, `description`, `price`, `category`, `stockQuantity`, and `image`.
+* Admins can create products with `name`, `description`, `price`, `category`, `subcategory`, `brand`, searchable `keywords`, `stockQuantity`, and `image`.
 * **Multer File Upload:** Real image uploads (`JPG`, `PNG`, `WEBP`) processed and served statically at `/uploads`.
 * Product updates with optional image replacements and complete product deletion with database cleanup.
 
 ### C. Product Browsing (Customer)
-* Real-time search bar querying products by name (`$regex`).
-* Category filtering for Women's Fashion, Men's Fashion, Electronics, Jewelry & Accessories, Beauty & Health, Toys & Games, Home & Kitchen, Sports & Entertainment, Party & Decor, and School & Office.
-* ETB price threshold filters (`maxPrice`) and multi-option sorting (`newest`, `price-asc`, `price-desc`, `name-asc`).
+* Debounced, case-insensitive partial search across product names, descriptions, categories, subcategories, brands, and admin-provided keywords. Multiple search terms can match across those fields.
+* Database-backed category, subcategory, and brand filters can be combined with search and an ETB minimum/maximum price range.
+* Sorting supports newest, price low-to-high/high-to-low, name, and popularity (ordered units, excluding cancelled orders).
+* Search and filter values are shareable in the catalog URL; the storefront shows the matching count, a no-results state, and a reset action.
 * Dedicated Product Details view with responsive image gallery, quantity selectors, and live stock indicators.
 
 ### D. Shopping Cart & Checkout
@@ -69,8 +70,8 @@
 * New orders receive a backend-generated, sequential customer-facing ID (`AS-00001`, `AS-00002`, etc.); the atomic MongoDB counter is incremented within the order transaction. MongoDB `_id` values remain in use for database relationships and API operations.
 * On backend startup, existing orders with legacy or missing readable IDs are assigned short IDs without changing their MongoDB `_id` values.
 * Dedicated order details and tracking pages show payment, delivery, pricing, and timestamped status-history information.
-* Administrators can search and filter by order/customer/payment status, sort by date or converted order amount, review full customer/address/product/payment details, and update status separately from delivery information. The orders table and detail modal show `Pending`, `Paid`, or `Failed` payment status; the current `isPaid` flag continues to take precedence for paid orders.
-* Status updates accept only the next fulfillment stage (or eligible pre-shipment cancellation), use an atomic compare-and-set, and append previous/new status, timestamp, admin note, and admin user ID to history. The admin modal offers direct actions for each allowed next step and displays history oldest to newest with timezone-aware timestamps. Payment status is not changed by shipment updates.
+* Administrators can search and filter by order/customer/payment status, sort by date or converted order amount, review full customer/address/product/payment details, and update status separately from delivery information. Payment status is stored separately from fulfillment status.
+* Status updates accept only the next fulfillment stage (or eligible pre-shipment cancellation), use an atomic compare-and-set, and append previous/new status, timestamp, admin note, and admin user ID to history. Orders cannot move to `Processing` or shipping unless payment is verified and marked paid.
 * Delivery tracking supports AllStore Delivery by default, optional tracking and delivery-person details, estimated/shipping/actual delivery dates, customer instructions, admin tracking notes, and transaction references. Legacy orders receive missing tracking defaults and a history entry when needed.
 * Checkout collects a delivery phone number and stores it with the order.
 * Customers can buy available products again and cancel unpaid orders only while they are `Pending` or `Confirmed`; cancellation restores their stock in the same database transaction.
@@ -78,13 +79,19 @@
 * Order statuses: `Pending`, `Confirmed`, `Processing`, `Shipped`, `Out for Delivery`, `Delivered`, and `Cancelled`.
 
 ### F. Payments
-* Chapa is used through its hosted checkout and server-side initialize/verify APIs. The application stores no card number or CVV and never trusts a browser return as proof of payment.
-* Configure `CHAPA_MODE` (`test` or `live`), `CHAPA_SECRET_KEY`, `CHAPA_WEBHOOK_SECRET`, and an externally reachable `API_PUBLIC_URL` in the backend environment. Test mode rejects live-form keys and live mode rejects test keys. Never place either secret in frontend environment variables.
-* `CHAPA_AVAILABLE_METHODS` is an optional comma-separated display list copied from the enabled methods in the merchant account. It does not override Chapa’s hosted checkout; the provider checkout remains authoritative. Omit PayPal unless it is enabled for both the Chapa provider and merchant account.
-* Chapa payment status is updated only after backend verification of transaction reference, amount, and currency. Signed webhooks are verified and then re-checked through Chapa’s verification API; repeated callbacks are idempotent.
-* Manual bank transfer is available only after setting `BANK_TRANSFER_BANK_NAME`, `BANK_TRANSFER_ACCOUNT_NAME`, and `BANK_TRANSFER_ACCOUNT_NUMBER` (optional `BANK_TRANSFER_BRANCH`). Receipt file signatures are validated; files are stored outside public static uploads and accessible only to authenticated administrators. Approval/rejection is recorded separately from order fulfillment.
-* Cash on Delivery remains available without gateway configuration. Digital checkout and manual bank transfer are disabled with a configuration message when their required backend settings are missing.
-* Chapa integration references: [Accept Payment](https://developer.chapa.co/integrations/accept-payments), [Verify Payment](https://developer.chapa.co/integrations/verify-payments), [Webhooks](https://developer.chapa.co/integrations/webhooks), and [Test Mode vs Live Mode](https://developer.chapa.co/integrations/test-mode-vs-live-mode).
+* Customer checkout supports only configured, active Bank Transfer, Telebirr, and CBE Birr methods. Cash on Delivery is not accepted for new orders.
+* Configure store-owned payment destinations in Admin Dashboard → Payment Settings. Bank Transfer requires bank name, account holder, and account number; Telebirr requires a business name and merchant account/number; CBE Birr requires an account holder and account/merchant details. Instructions and bank branch are optional. No account credentials are seeded or supplied by the application.
+* Customers pay the exact server-calculated order total, may enter a transaction reference, and must upload a JPG/JPEG, PNG, or PDF receipt (maximum 5 MB). Receipts are signature-checked and stored outside public static uploads. Uploading proof sets the payment to `Pending Verification`; it does not mark the order paid.
+* Only authenticated administrators can view receipts and confirm/reject submitted proofs. Confirmation records the administrator, date, and expected amount; rejection requires a customer-visible reason and permits corrected proof. Payment history stays on the MongoDB order record.
+* Payment and delivery statuses are separate. Unpaid/unverified orders cannot move to `Processing` or shipping. Verified orders count toward revenue; refunds remain incomplete until the actual payout is confirmed.
+* Chapa callback and verification routes remain for existing legacy orders. They are not offered as checkout methods.
+
+### G. Customer Bonus Features
+* Customers can submit 1–5 star reviews only for products in their delivered orders. Reviews are unique per customer/product/order, start pending, and appear publicly only after Admin approval.
+* Homepage and catalog pages show 10 products per page using MongoDB pagination. Catalog page links preserve the search, category, subcategory, brand, price, and sort query parameters.
+* Unknown routes and invalid/missing product IDs show a branded AllStore 404 page with Home and Continue Shopping links.
+* Authenticated customers have a MongoDB-backed wishlist, can add saved products to their cart, and see recently viewed products. Guest recently-viewed product IDs are kept in local browser storage.
+* Order, payment, return, and refund events create persistent customer notifications. Customers can review updates and mark one or all as read from the navigation notification menu.
 
 ---
 
@@ -107,12 +114,17 @@
 ### Products (`/api/products`)
 | Method | Endpoint | Access | Body / Params | Description |
 |---|---|---|---|---|
-| `GET` | `/api/products` | Public | Query: `keyword, category, maxPrice (ETB), sort` | Fetch products with search, category & price filters |
+| `GET` | `/api/products` | Public | Query: `keyword/search, category, subcategory, brand, minPrice/maxPrice (ETB), sort` | Fetch products with combined text search and catalog filters |
 | `GET` | `/api/products/categories` | Public | None | Returns list of distinct product categories |
+| `GET` | `/api/products/filters` | Public | Optional `category` | Returns database-backed category, subcategory, and brand filter options |
 | `GET` | `/api/products/:id` | Public | Path: `id` | Get single product details |
-| `POST` | `/api/products` | Admin | Multipart: `name, description, price (ETB), category, stockQuantity, image` | Create new ETB-priced product with Multer image upload |
-| `PUT` | `/api/products/:id` | Admin | Multipart: updated fields (`price` in ETB) + optional `image` | Update existing product |
+| `POST` | `/api/products` | Admin | Multipart: `name, description, price (ETB), category, subcategory, brand, keywords, stockQuantity, image` | Create new ETB-priced product with searchable metadata |
+| `PUT` | `/api/products/:id` | Admin | Multipart: updated fields (`price` in ETB; keywords are comma-separated) + optional `image` | Update existing product |
 | `DELETE` | `/api/products/:id` | Admin | Path: `id` | Delete product from database |
+| `GET` | `/api/products/:productId/reviews` | Public | Path: product `id` | Returns approved reviews, average rating, and review count |
+| `POST` | `/api/products/:productId/reviews` | Customer | `{ orderId, rating, body }` | Submits a review for a product in a delivered order; each purchase can be reviewed once |
+| `GET` | `/api/admin/reviews` | Admin | None | Lists customer reviews awaiting moderation |
+| `PATCH` | `/api/admin/reviews/:id` | Admin | `{ status: "Approved" \| "Rejected", moderationNote? }` | Approves or rejects a pending review |
 
 ### Orders (`/api/orders`)
 | Method | Endpoint | Access | Body / Params | Description |
@@ -125,7 +137,33 @@
 | `PUT` | `/api/orders/:id/status` | Admin | `{ status, adminNote }` | Applies a valid next status and appends an audited history entry |
 | `PATCH` | `/api/orders/:id/tracking` | Admin | Optional status, admin note, tracking and delivery fields | Updates delivery fields independently; when status changes, stores previous/new status, timestamp, admin note, and admin user ID |
 
-No email delivery/notification integration is configured. Admin success messages confirm database updates only; customers see new status and notes when their order data is fetched again.
+### Customer Features
+| Method | Endpoint | Access | Body / Params | Description |
+|---|---|---|---|---|
+| `GET` | `/api/customer/wishlist` | Customer | None | Returns the signed-in customer's saved products |
+| `POST` | `/api/customer/wishlist/:productId` | Customer | Path: product `id` | Adds a product to the wishlist |
+| `DELETE` | `/api/customer/wishlist/:productId` | Customer | Path: product `id` | Removes a product from the wishlist |
+| `GET` | `/api/customer/recently-viewed` | Customer | None | Returns up to 12 recently viewed products |
+| `POST` | `/api/customer/recently-viewed/:productId` | Customer | Path: product `id` | Records a viewed product |
+| `GET` | `/api/customer/notifications` | Customer | None | Lists the customer's most recent notifications |
+| `PATCH` | `/api/customer/notifications/:id/read` | Customer | Path: notification `id` | Marks an owned notification as read |
+| `PATCH` | `/api/customer/notifications/read-all` | Customer | None | Marks all unread customer notifications as read |
+
+### Payments
+| Method | Endpoint | Access | Body / Params | Description |
+|---|---|---|---|---|
+| `GET` | `/api/payment-settings/public` | Public | None | Returns only active, completely configured customer payment destinations; response is not cached |
+| `GET` | `/api/payment-settings` | Admin | None | Reads all payment settings, including incomplete and inactive methods |
+| `PUT` | `/api/payment-settings` | Admin | `disabledMethods`, `bankTransfer`, `telebirr`, `cbeBirr` | Validates and saves the shared MongoDB payment settings |
+| `POST` | `/api/payments/bank-transfer/:id/receipt` | Order owner | Multipart `receipt`; optional `transactionReference` | Uploads or replaces payment proof and sets the order to `Pending Verification` |
+| `GET` | `/api/payments/bank-transfer/:id/receipt` | Order owner | Path: order `id` | Downloads the caller's own payment proof |
+| `GET` | `/api/admin/payments/bank-transfers?status=awaiting` | Admin | Optional status: `awaiting`, `reviewed`, or `rejected` | Lists manual payment orders for verification |
+| `GET` | `/api/admin/payments/bank-transfers/:id/receipt` | Admin | Path: order `id` | Downloads an uploaded payment proof |
+| `PATCH` | `/api/admin/payments/bank-transfers/:id/review` | Admin | `{ decision: "approve" \| "reject", note }` | Confirms or rejects pending proof; rejection requires a reason |
+
+The previous `/api/payments/config` and `/api/admin/payments/settings` endpoints remain available for compatibility; the active checkout and Admin settings page use `/api/payment-settings`.
+
+No email delivery integration is configured. Payment decisions and rejection reasons are recorded as customer-visible order payment updates; customers see them when their order data is fetched again.
 
 ---
 

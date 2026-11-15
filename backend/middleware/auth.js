@@ -67,9 +67,20 @@ const admin = (req, res, next) => {
   });
 };
 
+const customer = (req, res, next) => {
+  if (req.user && req.user.role === 'customer') {
+    return next();
+  }
+  return res.status(403).json({
+    status: 'error',
+    message: 'Forbidden: Customer access required',
+  });
+};
+
 module.exports = {
   generateToken,
   getJwtSecret,
   protect,
   admin,
+  customer,
 };

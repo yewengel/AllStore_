@@ -26,6 +26,18 @@ const orderItemSchema = new mongoose.Schema({
     type: String,
     enum: ['ETB', 'USD'],
   },
+  variantId: {
+    type: mongoose.Schema.Types.ObjectId,
+  },
+  variantSku: {
+    type: String,
+    default: '',
+  },
+  options: {
+    type: Map,
+    of: String,
+    default: {},
+  },
   image: {
     type: String,
     default: '',
@@ -57,6 +69,11 @@ const trackingHistoryEntrySchema = new mongoose.Schema(
       enum: ['Pending', 'Confirmed', 'Processing', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled'],
     },
     adminNote: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+    customerMessage: {
       type: String,
       default: '',
       trim: true,
@@ -184,6 +201,7 @@ const orderSchema = new mongoose.Schema(
       type: String,
       enum: [
         'Pending',
+        'Awaiting Payment',
         'Processing',
         'Pending Verification',
         'Awaiting Verification',
@@ -274,6 +292,19 @@ const orderSchema = new mongoose.Schema(
       enum: ['Pending', 'Confirmed', 'Processing', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled'],
       default: 'Pending',
     },
+    cancellationReason: {
+      type: String,
+      default: '',
+      trim: true,
+      maxlength: 500,
+    },
+    cancelledAt: {
+      type: Date,
+    },
+    cancelledBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+    },
     trackingNumber: {
       type: String,
       default: '',
@@ -334,7 +365,7 @@ const orderSchema = new mongoose.Schema(
   }
 );
 
-orderSchema.pre('save', function (next) {
+orderSchema.pre('save', function () {
   if (!this.customerName && this.user && typeof this.user === 'object' && this.user.name) {
     this.customerName = this.user.name;
   }
@@ -363,7 +394,6 @@ orderSchema.pre('save', function (next) {
     ];
   }
 
-  next();
 });
 
 module.exports = mongoose.model('Order', orderSchema);

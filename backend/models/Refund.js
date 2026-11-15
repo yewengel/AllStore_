@@ -1,5 +1,35 @@
 const mongoose = require('mongoose');
 
+const refundHistoryEntrySchema = new mongoose.Schema(
+  {
+    status: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    message: {
+      type: String,
+      default: '',
+      trim: true,
+      maxlength: 500,
+    },
+    timestamp: {
+      type: Date,
+      default: Date.now,
+    },
+    actor: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+    },
+    actorRole: {
+      type: String,
+      enum: ['customer', 'admin', 'system'],
+      default: 'system',
+    },
+  },
+  { _id: true }
+);
+
 /**
  * Refund record linked to an order and its original payment.
  * A refund is only marked as "Refunded" after it has actually been
@@ -16,6 +46,10 @@ const refundSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Order',
       required: true,
+    },
+    returnRequest: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'ReturnRequest',
     },
     user: {
       type: mongoose.Schema.Types.ObjectId,
@@ -55,11 +89,37 @@ const refundSchema = new mongoose.Schema(
       type: String,
       default: '',
       trim: true,
+      maxlength: 500,
     },
     status: {
       type: String,
-      enum: ['Requested', 'Approved', 'Rejected', 'Processing', 'Refunded', 'Failed'],
+      enum: [
+        'Not Required',
+        'Refund Required',
+        'Pending',
+        'Requested',
+        'Approved',
+        'Rejected',
+        'Processing',
+        'Refunded',
+        'Failed',
+      ],
       default: 'Requested',
+    },
+    source: {
+      type: String,
+      enum: ['manual', 'order-cancellation', 'return'],
+      default: 'manual',
+    },
+    customerMessage: {
+      type: String,
+      default: '',
+      trim: true,
+      maxlength: 500,
+    },
+    history: {
+      type: [refundHistoryEntrySchema],
+      default: [],
     },
     provider: {
       type: String,
@@ -108,6 +168,9 @@ const refundSchema = new mongoose.Schema(
       type: String,
       default: '',
       trim: true,
+    },
+    failedAt: {
+      type: Date,
     },
   },
   { timestamps: true }

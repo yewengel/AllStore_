@@ -10,6 +10,7 @@ const {
 } = require('../utils/chapa');
 const { resolvePaymentConfiguration } = require('../utils/paymentSettings');
 const { hasValidReceiptSignature } = require('../middleware/paymentReceiptUpload');
+const { createNotification } = require('../utils/notifications');
 
 const receiptDirectory = path.join(__dirname, '..', 'private', 'payment-receipts');
 const clientUrl = () => (process.env.CLIENT_URL || 'http://localhost:5173').split(',')[0].trim();
@@ -88,11 +89,37 @@ const getPaymentConfig = async (req, res, next) => {
       },
       methods: config.methodEnabled,
       methodSupported: config.methodSupported,
-      bankTransfer: {
-        ...config.bankTransfer,
+      paymentMethods: {
+        'Bank Transfer': config.methodEnabled['Bank Transfer'] ? config.bankTransfer : null,
+        Telebirr: config.methodEnabled.Telebirr ? config.telebirr : null,
+        'CBE Birr': config.methodEnabled['CBE Birr'] ? config.cbeBirr : null,
       },
-      cashOnDelivery: { enabled: config.methodEnabled['Cash on Delivery'] },
     });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getPublicPaymentSettings = async (req, res, next) => {
+  try {
+    const config = await resolvePaymentConfiguration();
+    const paymentMethods = {};
+
+    if (config.methodEnabled['Bank Transfer']) {
+      const { bankName, accountName, accountNumber, branch, instructions } = config.bankTransfer;
+      paymentMethods['Bank Transfer'] = { bankName, accountName, accountNumber, branch, instructions };
+    }
+    if (config.methodEnabled.Telebirr) {
+      const { businessName, accountDetails, instructions } = config.telebirr;
+      paymentMethods.Telebirr = { businessName, accountDetails, instructions };
+    }
+    if (config.methodEnabled['CBE Birr']) {
+      const { accountName, accountDetails, instructions } = config.cbeBirr;
+      paymentMethods['CBE Birr'] = { accountName, accountDetails, instructions };
+    }
+
+    res.set('Cache-Control', 'no-store');
+    return res.json({ currency: 'ETB', paymentMethods });
   } catch (error) {
     return next(error);
   }
@@ -207,7 +234,28 @@ const updateChapaPaymentFromProvider = async (txRef) => {
     },
     { new: true, runValidators: true }
   );
-  if (updatedOrder) return { order: updatedOrder, alreadyProcessed: false };
+  if (updatedOrder) {
+    if (updatedOrder.paymentStatus === 'Paid') {
+      await createNotification(updatedOrder.user, {
+        type: 'payment-confirmation',
+        title: 'Payment verified',
+        message: `Payment for order ${updatedOrder.orderNumber} has been confirmed.`,
+        link: `/orders/${updatedOrder._id}`,
+        relatedEntityType: 'order',
+        relatedEntityId: updatedOrder._id,
+      });
+    } else {
+      await createNotification(updatedOrder.user, {
+        type: 'payment-update',
+        title: 'Payment update',
+        message: `Payment for order ${updatedOrder.orderNumber} is ${updatedOrder.paymentStatus.toLowerCase()}.`,
+        link: `/orders/${updatedOrder._id}`,
+        relatedEntityType: 'order',
+        relatedEntityId: updatedOrder._id,
+      });
+    }
+    return { order: updatedOrder, alreadyProcessed: false };
+  }
 
   const currentOrder = await Order.findById(order._id);
   if (currentOrder?.isPaid || currentOrder?.paymentStatus === 'Paid') {
@@ -315,13 +363,19 @@ const uploadBankTransferReceipt = async (req, res, next) => {
   let storedPath;
   try {
     if (!req.file || !hasValidReceiptSignature(req.file)) {
-      return res.status(400).json({ status: 'error', message: 'Upload a valid JPG, PNG, WebP, or PDF payment receipt.' });
+      return res.status(400).json({ status: 'error', message: 'Upload a valid JPG, JPEG, PNG, or PDF payment receipt.' });
+    }
+    const { transactionReference } = req.body || {};
+    if (transactionReference !== undefined && (
+      typeof transactionReference !== 'string' || transactionReference.trim().length > 200
+    )) {
+      return res.status(400).json({ status: 'error', message: 'Payment transaction reference must be no longer than 200 characters.' });
     }
     const order = await Order.findOne({
       _id: req.params.id,
       user: req.user._id,
-      paymentMethod: 'Bank Transfer',
-      paymentStatus: { $in: ['Pending', 'Pending Verification', 'Rejected'] },
+      paymentMethod: { $in: ['Bank Transfer', 'Telebirr', 'CBE Birr'] },
+      paymentStatus: { $in: ['Awaiting Payment', 'Pending', 'Pending Verification', 'Rejected'] },
       orderStatus: { $ne: 'Cancelled' },
       isPaid: { $ne: true },
     });
@@ -333,15 +387,28 @@ const uploadBankTransferReceipt = async (req, res, next) => {
     await fs.writeFile(storedPath, req.file.buffer, { flag: 'wx', mode: 0o600 });
 
     const previousStorageKey = order.paymentReceipt?.storageKey;
+    const previousStatus = order.paymentStatus;
     order.paymentReceipt = {
       storageKey,
       mimeType: req.file.mimetype,
       originalName: path.basename(req.file.originalname).slice(0, 120),
       uploadedAt: new Date(),
     };
-    order.paymentAmount = order.paymentAmount ?? order.totalPrice;
-    order.paymentCurrency = order.paymentCurrency || order.currency || 'ETB';
+    order.paymentAmount = Number(order.totalPrice);
+    order.paymentCurrency = order.currency || 'ETB';
+    if (transactionReference !== undefined) order.transactionReference = transactionReference.trim();
     order.paymentStatus = 'Pending Verification';
+    order.paymentReviewNote = '';
+    order.paymentReviewedAt = null;
+    order.paymentReviewedBy = null;
+    order.paymentHistory = order.paymentHistory || [];
+    order.paymentHistory.push(paymentHistoryEntry('Pending Verification', {
+      previousStatus,
+      message: previousStatus === 'Rejected'
+        ? 'Corrected payment proof submitted and awaiting administrator verification.'
+        : 'Payment proof submitted and awaiting administrator verification.',
+      amount: order.paymentAmount,
+    }));
     await order.save();
     if (previousStorageKey && /^[0-9a-f-]{36}$/i.test(previousStorageKey)) {
       await fs.unlink(path.join(receiptDirectory, previousStorageKey)).catch((error) => {
@@ -422,15 +489,19 @@ const reviewBankTransfer = async (req, res, next) => {
 
     const paymentFilter = {
       _id: req.params.id,
-      paymentMethod: 'Bank Transfer',
+      paymentMethod: { $in: ['Bank Transfer', 'Telebirr', 'CBE Birr'] },
       paymentStatus: { $in: ['Pending Verification', 'Awaiting Verification'] },
       isPaid: { $ne: true },
       'paymentReceipt.storageKey': { $exists: true, $ne: '' },
-      transactionReference: { $exists: true, $ne: '' },
       ...(decision === 'approve' ? { orderStatus: { $ne: 'Cancelled' } } : {}),
     };
     const order = await Order.findOne(paymentFilter);
-    if (!order) return res.status(409).json({ status: 'error', message: 'This bank transfer is not awaiting review.' });
+    if (!order) return res.status(409).json({ status: 'error', message: 'This payment is not awaiting review or has already been reviewed.' });
+    const expectedAmount = Number(order.totalPrice);
+    const submittedAmount = Number(order.paymentAmount);
+    if (!Number.isFinite(expectedAmount) || expectedAmount <= 0 || submittedAmount !== expectedAmount) {
+      return res.status(409).json({ status: 'error', message: 'The submitted payment amount does not match the order total.' });
+    }
 
     const approved = decision === 'approve';
     const timestamp = new Date();
@@ -455,11 +526,11 @@ const reviewBankTransfer = async (req, res, next) => {
           paymentHistory: paymentHistoryEntry(approved ? 'Paid' : 'Rejected', {
             previousStatus: order.paymentStatus,
             message: approved
-              ? 'Bank transfer verified and approved by an administrator.'
-              : 'Bank transfer rejected by an administrator.',
+              ? 'Payment verified against the merchant account and approved by an administrator.'
+              : `Payment proof rejected: ${note.trim()}`,
             adminNote: note.trim(),
             adminUserId: req.user._id,
-            amount: Number(order.paymentAmount ?? order.totalPrice),
+            amount: expectedAmount,
           }),
         },
       },
@@ -468,6 +539,16 @@ const reviewBankTransfer = async (req, res, next) => {
     if (!updatedOrder) {
       return res.status(409).json({ status: 'error', message: 'This payment was already reviewed.' });
     }
+    await createNotification(updatedOrder.user, {
+      type: approved ? 'payment-confirmation' : 'payment-rejected',
+      title: approved ? 'Payment confirmed' : 'Payment proof needs correction',
+      message: approved
+        ? `Payment for order ${updatedOrder.orderNumber} has been verified.`
+        : `Payment proof for order ${updatedOrder.orderNumber} was rejected: ${note.trim()}`,
+      link: `/orders/${updatedOrder._id}`,
+      relatedEntityType: 'order',
+      relatedEntityId: updatedOrder._id,
+    });
     return res.json({
       orderId: updatedOrder._id,
       orderNumber: updatedOrder.orderNumber,
@@ -486,6 +567,7 @@ const reviewBankTransfer = async (req, res, next) => {
 module.exports = {
   paymentHistoryEntry,
   getPaymentConfig,
+  getPublicPaymentSettings,
   getAllPayments,
   getMyPayments,
   initializeChapaPayment,

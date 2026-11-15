@@ -18,7 +18,9 @@ const errorHandler = (err, req, res, next) => {
     : Number.isInteger(err.status)
       ? err.status
       : 500;
-  let message = err.message;
+  let message = typeof err?.message === 'string'
+    ? err.message
+    : 'An unexpected server error occurred.';
 
   if (err.name === 'MulterError') {
     statusCode = err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;

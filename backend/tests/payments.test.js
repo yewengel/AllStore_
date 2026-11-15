@@ -1,19 +1,27 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+require('./helpers/mockNotifications');
 const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const mongoose = require('mongoose');
 const Order = require('../models/Order');
+const PaymentSetting = require('../models/PaymentSetting');
 const {
   getPaymentConfig,
+  getPublicPaymentSettings,
   initializeChapaPayment,
   updateChapaPaymentFromProvider,
   handleChapaWebhook,
   uploadBankTransferReceipt,
   reviewBankTransfer,
 } = require('../controllers/paymentController');
+const {
+  getAdminPaymentSettings,
+  updateAdminPaymentSettings,
+} = require('../controllers/adminPaymentController');
 const { getPaymentConfiguration } = require('../utils/chapa');
+const { resolvePaymentConfiguration } = require('../utils/paymentSettings');
 
 const receiptDirectory = path.join(__dirname, '..', 'private', 'payment-receipts');
 const createResponse = () => ({
@@ -30,6 +38,10 @@ const createResponse = () => ({
   },
   setHeader(name, value) {
     this.headers[name] = value;
+  },
+  set(name, value) {
+    this.headers[name] = value;
+    return this;
   },
 });
 
@@ -63,6 +75,162 @@ test('payment configuration never exposes secrets and disables incomplete gatewa
     if (originalWebhookSecret === undefined) delete process.env.CHAPA_WEBHOOK_SECRET;
     else process.env.CHAPA_WEBHOOK_SECRET = originalWebhookSecret;
     restore();
+  }
+});
+
+test('only active methods with administrator-entered payment details are enabled', async () => {
+  const keys = ['CHAPA_MODE', 'CHAPA_SECRET_KEY', 'CHAPA_WEBHOOK_SECRET', 'API_PUBLIC_URL', 'CHAPA_AVAILABLE_METHODS'];
+  const original = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const originalReadyState = mongoose.connection.readyState;
+  const originalFindOne = PaymentSetting.findOne;
+  process.env.CHAPA_MODE = 'test';
+  process.env.CHAPA_SECRET_KEY = 'CHASECK_TEST-test-only-key';
+  process.env.CHAPA_WEBHOOK_SECRET = 'test-only-webhook-secret';
+  process.env.API_PUBLIC_URL = 'https://payments.example.test';
+  process.env.CHAPA_AVAILABLE_METHODS = '';
+
+  try {
+    mongoose.connection.readyState = 1;
+    let settings = { disabledMethods: [] };
+    PaymentSetting.findOne = () => ({ lean: async () => settings });
+    const emptyConfiguration = await resolvePaymentConfiguration();
+    assert.equal(emptyConfiguration.methodEnabled['Bank Transfer'], false);
+    assert.equal(emptyConfiguration.methodEnabled.Telebirr, false);
+    assert.equal(emptyConfiguration.methodEnabled['CBE Birr'], false);
+
+    settings = {
+      disabledMethods: [],
+      bankTransfer: { bankName: 'Test Bank', accountName: 'Test Store', accountNumber: 'test-bank-account' },
+      telebirr: { businessName: 'Test Store', accountDetails: 'test-telebirr-account' },
+      cbeBirr: { accountName: 'Test Store', accountDetails: 'test-cbe-account' },
+    };
+    const configured = await resolvePaymentConfiguration();
+    assert.deepEqual(configured.methodEnabled, { 'Bank Transfer': true, Telebirr: true, 'CBE Birr': true });
+
+    settings.disabledMethods = ['Telebirr'];
+    const inactive = await resolvePaymentConfiguration();
+    assert.equal(inactive.methodEnabled.Telebirr, false);
+    assert.equal(inactive.methodEnabled['CBE Birr'], true);
+  } finally {
+    mongoose.connection.readyState = originalReadyState;
+    PaymentSetting.findOne = originalFindOne;
+    keys.forEach((key) => {
+      if (original[key] === undefined) delete process.env[key];
+      else process.env[key] = original[key];
+    });
+  }
+});
+
+test('public payment settings return only active customer instructions', async () => {
+  const originalReadyState = mongoose.connection.readyState;
+  const originalFindOne = PaymentSetting.findOne;
+  try {
+    mongoose.connection.readyState = 1;
+    PaymentSetting.findOne = () => ({
+      lean: async () => ({
+        disabledMethods: ['Telebirr'],
+        bankTransfer: {
+          bankName: 'Test Bank',
+          accountName: 'Test Store',
+          accountNumber: 'test-bank-account',
+          branch: 'Main',
+          instructions: 'Use the order number.',
+        },
+        telebirr: { businessName: 'Test Store', accountDetails: 'inactive-test-account' },
+        cbeBirr: { accountName: '', accountDetails: '' },
+      }),
+    });
+
+    const response = createResponse();
+    await getPublicPaymentSettings({}, response, (error) => { throw error; });
+
+    assert.deepEqual(response.body, {
+      currency: 'ETB',
+      paymentMethods: {
+        'Bank Transfer': {
+          bankName: 'Test Bank',
+          accountName: 'Test Store',
+          accountNumber: 'test-bank-account',
+          branch: 'Main',
+          instructions: 'Use the order number.',
+        },
+      },
+    });
+    assert.equal(response.headers['Cache-Control'], 'no-store');
+    assert.equal(JSON.stringify(response.body).includes('inactive-test-account'), false);
+  } finally {
+    mongoose.connection.readyState = originalReadyState;
+    PaymentSetting.findOne = originalFindOne;
+  }
+});
+
+test('admin payment settings report CBE completeness from the CBE fields', async () => {
+  const originalReadyState = mongoose.connection.readyState;
+  const originalFindOneAndUpdate = PaymentSetting.findOneAndUpdate;
+  const originalFindOne = PaymentSetting.findOne;
+  const savedSettings = {
+    disabledMethods: [],
+    bankTransfer: { bankName: '', accountName: '', accountNumber: '' },
+    telebirr: { businessName: '', accountDetails: '' },
+    cbeBirr: { accountName: 'Test Store', accountDetails: 'test-cbe-account' },
+  };
+  try {
+    mongoose.connection.readyState = 1;
+    PaymentSetting.findOneAndUpdate = () => ({ lean: async () => savedSettings });
+    PaymentSetting.findOne = () => ({ lean: async () => savedSettings });
+
+    const response = createResponse();
+    await getAdminPaymentSettings({}, response, (error) => { throw error; });
+
+    assert.equal(response.body.bankTransfer.configured, false);
+    assert.equal(response.body.cbeBirr.configured, true);
+    assert.equal(response.body.methods.find(({ method }) => method === 'CBE Birr').supported, true);
+  } finally {
+    mongoose.connection.readyState = originalReadyState;
+    PaymentSetting.findOneAndUpdate = originalFindOneAndUpdate;
+    PaymentSetting.findOne = originalFindOne;
+  }
+});
+
+test('admin can save shared payment settings and receives the persisted configuration', async () => {
+  const originalReadyState = mongoose.connection.readyState;
+  const originalFindOneAndUpdate = PaymentSetting.findOneAndUpdate;
+  const originalFindOne = PaymentSetting.findOne;
+  let savedSettings = { key: 'payment', disabledMethods: [] };
+  let writeCount = 0;
+  try {
+    mongoose.connection.readyState = 1;
+    PaymentSetting.findOneAndUpdate = (_filter, update) => {
+      if (update.$set) {
+        savedSettings = { ...savedSettings, ...update.$set };
+        writeCount += 1;
+      }
+      return { lean: async () => savedSettings };
+    };
+    PaymentSetting.findOne = () => ({ lean: async () => savedSettings });
+
+    const response = createResponse();
+    await updateAdminPaymentSettings({
+      user: { _id: new mongoose.Types.ObjectId() },
+      body: {
+        bankTransfer: {
+          bankName: 'Test Bank',
+          accountName: 'Test Store',
+          accountNumber: 'test-bank-account',
+          branch: '',
+          instructions: 'Use the order number.',
+        },
+        disabledMethods: [],
+      },
+    }, response, (error) => { throw error; });
+
+    assert.equal(writeCount, 1);
+    assert.equal(response.body.bankTransfer.accountNumber, 'test-bank-account');
+    assert.equal(response.body.methods.find(({ method }) => method === 'Bank Transfer').enabled, true);
+  } finally {
+    mongoose.connection.readyState = originalReadyState;
+    PaymentSetting.findOneAndUpdate = originalFindOneAndUpdate;
+    PaymentSetting.findOne = originalFindOne;
   }
 });
 
@@ -407,6 +575,7 @@ test('bank transfer receipt upload stores a private verified file and enters pen
     totalPrice: 42,
     paymentMethod: 'Bank Transfer',
     paymentStatus: 'Pending',
+    paymentHistory: [],
     paymentCurrency: 'ETB',
     isPaid: false,
     save: async () => order,
@@ -453,8 +622,10 @@ test('admin approval and rejection update bank transfer payment without changing
         orderNumber: 'AS-00127',
         paymentMethod: 'Bank Transfer',
         paymentStatus: 'Pending Verification',
+        totalPrice: 42,
+        paymentAmount: 42,
         paymentReceipt: { storageKey: 'receipt-key' },
-        orderStatus: 'Processing',
+        orderStatus: 'Pending',
         isPaid: false,
       };
       let capturedUpdate;
@@ -479,11 +650,99 @@ test('admin approval and rejection update bank transfer payment without changing
         assert.equal(response.statusCode, 200);
         assert.equal(response.body.paymentStatus, expectedStatus);
         assert.equal(response.body.isPaid, expectedPaid);
-        assert.equal(order.orderStatus, 'Processing');
+        assert.equal(order.orderStatus, 'Pending');
         assert.equal(capturedUpdate.$set.paymentReviewNote, 'Reviewed receipt.');
       } finally {
         Order.findOne = originalFindOne;
         Order.findOneAndUpdate = originalFindOneAndUpdate;
+      }
+    });
+
+  }
+});
+
+test('Bank Transfer, Telebirr, and CBE Birr proofs are manually verified once', async (t) => {
+  for (const paymentMethod of ['Bank Transfer', 'Telebirr', 'CBE Birr']) {
+    await t.test(paymentMethod, async () => {
+      const originalFindOne = Order.findOne;
+      const originalFindOneAndUpdate = Order.findOneAndUpdate;
+      const order = {
+        _id: new mongoose.Types.ObjectId(),
+        orderNumber: 'AS-00999',
+        paymentMethod,
+        paymentStatus: 'Awaiting Payment',
+        totalPrice: 42,
+        paymentAmount: 42,
+        paymentCurrency: 'ETB',
+        isPaid: false,
+        orderStatus: 'Pending',
+        paymentHistory: [],
+        save: async () => order,
+      };
+      Order.findOne = async (filter) => {
+        if (filter.paymentStatus?.$in && !filter.paymentStatus.$in.includes(order.paymentStatus)) return null;
+        if (filter.paymentMethod?.$in && !filter.paymentMethod.$in.includes(order.paymentMethod)) return null;
+        return order;
+      };
+      Order.findOneAndUpdate = async (_filter, update) => {
+        if (order.paymentStatus !== 'Pending Verification') return null;
+        Object.assign(order, update.$set);
+        order.paymentHistory.push(update.$push.paymentHistory);
+        return order;
+      };
+
+      try {
+        const uploadResponse = createResponse();
+        await uploadBankTransferReceipt(
+          {
+            params: { id: order._id.toString() },
+            user: { _id: new mongoose.Types.ObjectId() },
+            body: {},
+            file: {
+              originalname: 'payment.pdf',
+              mimetype: 'application/pdf',
+              buffer: Buffer.from('%PDF-1.4 manual payment proof'),
+            },
+          },
+          uploadResponse,
+          (error) => { throw error; }
+        );
+        assert.equal(uploadResponse.statusCode, 200);
+        assert.equal(order.paymentStatus, 'Pending Verification');
+        assert.equal(order.isPaid, false);
+
+        const reviewResponse = createResponse();
+        await reviewBankTransfer(
+          {
+            params: { id: order._id.toString() },
+            user: { _id: new mongoose.Types.ObjectId() },
+            body: { decision: 'approve', note: 'Checked actual merchant account.' },
+          },
+          reviewResponse,
+          (error) => { throw error; }
+        );
+        assert.equal(reviewResponse.statusCode, 200);
+        assert.equal(order.paymentStatus, 'Paid');
+        assert.equal(order.isPaid, true);
+        assert.equal(order.paymentAmount, order.totalPrice);
+
+        const duplicateResponse = createResponse();
+        await reviewBankTransfer(
+          {
+            params: { id: order._id.toString() },
+            user: { _id: new mongoose.Types.ObjectId() },
+            body: { decision: 'approve', note: 'Duplicate confirmation attempt.' },
+          },
+          duplicateResponse,
+          (error) => { throw error; }
+        );
+        assert.equal(duplicateResponse.statusCode, 409);
+      } finally {
+        Order.findOne = originalFindOne;
+        Order.findOneAndUpdate = originalFindOneAndUpdate;
+        if (order.paymentReceipt?.storageKey) {
+          await fs.unlink(path.join(receiptDirectory, order.paymentReceipt.storageKey)).catch(() => {});
+        }
       }
     });
   }

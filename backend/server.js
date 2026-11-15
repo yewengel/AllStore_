@@ -10,7 +10,9 @@ const mongoose = require('mongoose');
 const { getJwtSecret } = require('./middleware/auth');
 const { initializeOrderNumbers } = require('./utils/orderNumbers');
 const paymentRoutes = require('./routes/paymentRoutes');
+const paymentSettingsRoutes = require('./routes/paymentSettingsRoutes');
 const { handleChapaWebhook } = require('./controllers/paymentController');
+const customerRoutes = require('./routes/customerRoutes');
 
 // Import route modules
 const authRoutes = require('./routes/authRoutes');
@@ -18,6 +20,7 @@ const adminRoutes = require('./routes/adminRoutes');
 const adminPaymentRoutes = require('./routes/adminPaymentRoutes');
 const productRoutes = require('./routes/productRoutes');
 const orderRoutes = require('./routes/orderRoutes');
+const returnRoutes = require('./routes/returnRoutes');
 const { notFound, errorHandler } = require('./middleware/error');
 
 // Initialize Express app
@@ -79,7 +82,10 @@ app.use('/api/admin/payments', adminPaymentRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/products', productRoutes);
 app.use('/api/orders', orderRoutes);
+app.use('/api/returns', returnRoutes);
 app.use('/api/payments', paymentRoutes);
+app.use('/api/payment-settings', paymentSettingsRoutes);
+app.use('/api/customer', customerRoutes);
 
 // Error handling middleware
 app.use(notFound);

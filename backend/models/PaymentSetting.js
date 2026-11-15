@@ -2,8 +2,7 @@ const mongoose = require('mongoose');
 
 /**
  * Store-wide payment settings (singleton document keyed by "payment").
- * Stores administrator choices that are not sensitive: which methods are
- * disabled, and the manual bank transfer details shown to customers.
+ * Stores administrator choices and customer-facing payment destinations.
  * Gateway credentials remain in backend environment variables only.
  */
 const paymentSettingSchema = new mongoose.Schema(
@@ -23,6 +22,16 @@ const paymentSettingSchema = new mongoose.Schema(
       accountName: { type: String, default: '', trim: true },
       accountNumber: { type: String, default: '', trim: true },
       branch: { type: String, default: '', trim: true },
+      instructions: { type: String, default: '', trim: true },
+    },
+    telebirr: {
+      businessName: { type: String, default: '', trim: true },
+      accountDetails: { type: String, default: '', trim: true },
+      instructions: { type: String, default: '', trim: true },
+    },
+    cbeBirr: {
+      accountName: { type: String, default: '', trim: true },
+      accountDetails: { type: String, default: '', trim: true },
       instructions: { type: String, default: '', trim: true },
     },
     updatedBy: {

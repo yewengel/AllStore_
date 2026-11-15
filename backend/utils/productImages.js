@@ -26,8 +26,19 @@ const removeProductImageIfUnreferenced = async (imagePath) => {
   if (!absolutePath) return;
 
   const [productReference, orderReference] = await Promise.all([
-    Product.exists({ image: imagePath }),
-    Order.exists({ 'orderItems.image': imagePath }),
+    Product.exists({
+      $or: [
+        { image: imagePath },
+        { images: imagePath },
+        { 'variants.image': imagePath },
+      ],
+    }),
+    Order.exists({
+      $or: [
+        { 'orderItems.image': imagePath },
+        { 'items.image': imagePath },
+      ],
+    }),
   ]);
   if (productReference || orderReference) return;
 

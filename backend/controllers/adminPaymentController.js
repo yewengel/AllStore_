@@ -2,9 +2,12 @@ const mongoose = require('mongoose');
 const Order = require('../models/Order');
 const User = require('../models/User');
 const Refund = require('../models/Refund');
+const ReturnRequest = require('../models/ReturnRequest');
 const PaymentSetting = require('../models/PaymentSetting');
 const { toEtb } = require('../utils/currency');
+const { calculateFinancialMetrics } = require('../utils/financialAnalytics');
 const { nextRefundNumber } = require('../utils/orderNumbers');
+const { createNotification } = require('../utils/notifications');
 const { refundChapaTransaction } = require('../utils/chapa');
 const { paymentHistoryEntry } = require('./paymentController');
 const {
@@ -12,15 +15,17 @@ const {
   resolvePaymentConfiguration,
 } = require('../utils/paymentSettings');
 
-const ALL_METHODS = ['Telebirr', 'M-Pesa', 'Bank Transfer', 'Visa', 'Mastercard', 'Cash on Delivery'];
-const ONLINE_METHODS = ['Telebirr', 'M-Pesa', 'Visa', 'Mastercard'];
+const ALL_METHODS = ['Telebirr', 'CBE Birr', 'Bank Transfer'];
+const ONLINE_METHODS = [];
 const PAYMENT_STATUSES = [
   'Pending',
+  'Awaiting Payment',
   'Processing',
   'Paid',
   'Failed',
   'Cancelled',
   'Awaiting Verification',
+  'Pending Verification',
   'Unpaid',
   'Refunded',
   'Partially Refunded',
@@ -29,6 +34,7 @@ const PAYMENT_STATUSES = [
 
 const METHOD_KEYWORDS = {
   Telebirr: ['telebirr'],
+  'CBE Birr': ['cbe birr', 'cbebirr'],
   'M-Pesa': ['m-pesa', 'mpesa', 'm_pesa', 'm pesa'],
   Visa: ['visa'],
   Mastercard: ['mastercard', 'master card', 'master-card'],
@@ -67,7 +73,8 @@ const effectiveStatus = (order) => {
   if (order.paymentStatus === 'Partially Refunded') return 'Partially Refunded';
   if (order.isPaid && refunded > 0) return 'Partially Refunded';
   if (order.isPaid || order.paymentStatus === 'Paid') return 'Paid';
-  if (['Pending Verification', 'Awaiting Verification'].includes(order.paymentStatus)) return 'Awaiting Verification';
+  if (['Pending Verification', 'Awaiting Verification'].includes(order.paymentStatus)) return 'Pending Verification';
+  if (order.paymentStatus === 'Awaiting Payment') return 'Awaiting Payment';
   if (order.paymentMethod === 'Cash on Delivery' && (order.paymentStatus === 'Pending' || !order.paymentStatus)) return 'Unpaid';
   return order.paymentStatus || 'Pending';
 };
@@ -114,181 +121,73 @@ const serializeTransaction = (order) => ({
 // Dashboard statistics
 // ---------------------------------------------------------------------------
 
-const PERIODS = {
-  daily: { count: 14, unit: 'day' },
-  weekly: { count: 8, unit: 'week' },
-  monthly: { count: 12, unit: 'month' },
-  yearly: { count: 5, unit: 'year' },
-};
-
-const startOfUtcDay = (date) => Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
-
-const buildBuckets = (period) => {
-  const now = new Date();
-  const buckets = [];
-  if (period === 'daily') {
-    const today = startOfUtcDay(now);
-    for (let i = 13; i >= 0; i -= 1) {
-      const start = today - i * 86400000;
-      buckets.push({
-        start,
-        end: start + 86400000,
-        label: new Date(start).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' }),
-        revenue: 0,
-        count: 0,
-      });
-    }
-  } else if (period === 'weekly') {
-    const today = startOfUtcDay(now);
-    const weekday = new Date(today).getUTCDay();
-    const mondayOffset = (weekday + 6) % 7;
-    const weekStart = today - mondayOffset * 86400000;
-    for (let i = 7; i >= 0; i -= 1) {
-      const start = weekStart - i * 7 * 86400000;
-      buckets.push({
-        start,
-        end: start + 7 * 86400000,
-        label: new Date(start).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' }),
-        revenue: 0,
-        count: 0,
-      });
-    }
-  } else if (period === 'monthly') {
-    for (let i = 11; i >= 0; i -= 1) {
-      const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
-      const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i + 1, 1));
-      buckets.push({
-        start: start.getTime(),
-        end: end.getTime(),
-        label: start.toLocaleDateString('en-US', {
-          month: 'short',
-          ...(start.getUTCFullYear() !== now.getUTCFullYear() ? { year: '2-digit' } : {}),
-          timeZone: 'UTC',
-        }),
-        revenue: 0,
-        count: 0,
-      });
-    }
-  } else {
-    for (let i = 4; i >= 0; i -= 1) {
-      const start = Date.UTC(now.getUTCFullYear() - i, 0, 1);
-      const end = Date.UTC(now.getUTCFullYear() - i + 1, 0, 1);
-      buckets.push({ start, end, label: String(now.getUTCFullYear() - i), revenue: 0, count: 0 });
-    }
-  }
-  return buckets;
-};
-
 const getPaymentStats = async (req, res, next) => {
   try {
-    const period = PERIODS[req.query.period] ? req.query.period : 'monthly';
-
-    const successfulFilter = { isPaid: true, orderStatus: { $ne: 'Cancelled' } };
-    const amountExpr = {
-      $let: {
-        vars: {
-          amount: { $ifNull: ['$paymentAmount', { $ifNull: ['$totalPrice', 0] }] },
-          currency: { $ifNull: ['$paymentCurrency', { $ifNull: ['$currency', 'ETB'] }] },
+    const [orders, refunds, recentOrders] = await Promise.all([
+      Order.aggregate([
+        {
+          $project: {
+            _id: 1,
+            paymentMethod: 1,
+            paymentChannel: 1,
+            paymentStatus: 1,
+            isPaid: 1,
+            paymentAmount: 1,
+            paymentCurrency: 1,
+            totalPrice: 1,
+            currency: 1,
+            paymentDate: 1,
+            paidAt: 1,
+            codCollectionStatus: 1,
+            codCollectedAmount: 1,
+            codCollectedAt: 1,
+            orderStatus: 1,
+            createdAt: 1,
+            updatedAt: 1,
+          },
         },
-        in: {
-          $cond: [
-            { $eq: ['$$currency', 'ETB'] },
-            '$$amount',
-            { $multiply: ['$$amount', Number(process.env.ETB_PER_USD) || 164.62] },
-          ],
+      ]),
+      Refund.aggregate([
+        { $match: { status: 'Refunded' } },
+        {
+          $project: {
+            _id: 1,
+            order: 1,
+            amount: 1,
+            currency: 1,
+            provider: 1,
+            providerRefundReference: 1,
+            processedAt: 1,
+            status: 1,
+          },
         },
-      },
-    };
-
-    const [revenueAgg, refundAgg, codAgg, methodAgg, failedCount, pendingCount, paidCount, dailyRevenue, recentOrders] =
-      await Promise.all([
-        Order.aggregate([
-          { $match: successfulFilter },
-          { $group: { _id: null, total: { $sum: amountExpr } } },
-        ]),
-        Refund.aggregate([
-          { $match: { status: 'Refunded' } },
-          { $group: { _id: null, total: { $sum: '$amount' } } },
-        ]),
-        Order.aggregate([
-          {
-            $match: {
-              paymentMethod: 'Cash on Delivery',
-              isPaid: { $ne: true },
-              orderStatus: { $ne: 'Cancelled' },
-              codCollectionStatus: { $ne: 'Collected' },
-            },
-          },
-          { $group: { _id: null, total: { $sum: amountExpr } } },
-        ]),
-        Order.aggregate([
-          { $match: { orderStatus: { $ne: 'Cancelled' } } },
-          {
-            $group: {
-              _id: {
-                method: '$paymentMethod',
-                channel: { $ifNull: ['$paymentChannel', ''] },
-              },
-              count: { $sum: 1 },
-              amount: { $sum: amountExpr },
-            },
-          },
-        ]),
-        Order.countDocuments({ paymentStatus: 'Failed' }),
-        Order.countDocuments({
-          isPaid: { $ne: true },
-          orderStatus: { $ne: 'Cancelled' },
-          paymentStatus: { $in: ['Pending', 'Processing', 'Pending Verification', 'Awaiting Verification'] },
-        }),
-        Order.countDocuments(successfulFilter),
-        Order.aggregate([
-          { $match: successfulFilter },
-          {
-            $project: {
-              amount: amountExpr,
-              date: { $ifNull: ['$paymentDate', { $ifNull: ['$paidAt', '$createdAt'] }] },
-            },
-          },
-          {
-            $group: {
-              _id: { $dateToString: { date: '$date', format: '%Y-%m-%d' } },
-              revenue: { $sum: '$amount' },
-              count: { $sum: 1 },
-            },
-          },
-        ]),
+      ]),
         Order.find({}).populate('user', 'name email').sort({ createdAt: -1 }).limit(8),
-      ]);
+    ]);
+
+    const metrics = calculateFinancialMetrics({
+      orders,
+      refunds,
+      period: req.query.period,
+    });
 
     const methodBreakdown = ALL_METHODS.map((method) => ({ method, count: 0, amount: 0 }));
     const methodIndex = new Map(methodBreakdown.map((entry) => [entry.method, entry]));
     let other = { method: 'Other', count: 0, amount: 0 };
-    methodAgg.forEach((row) => {
-      const label = normalizeMethod({ paymentMethod: row._id.method, paymentChannel: row._id.channel });
+    metrics.methodStats.forEach((row) => {
+      const label = normalizeMethod({ paymentMethod: row.method, paymentChannel: row.channel });
       const target = methodIndex.get(label);
       if (target) {
         target.count += row.count;
-        target.amount += row.amount || 0;
+        target.amount += row.amount;
       } else {
         other.count += row.count;
-        other.amount += row.amount || 0;
+        other.amount += row.amount;
       }
     });
     methodIndex.forEach((entry) => { entry.amount = round2(entry.amount); });
     other = { ...other, amount: round2(other.amount) };
     const methodBreakdownWithOther = other.count > 0 ? [...methodBreakdown, other] : methodBreakdown;
-
-    const buckets = buildBuckets(period);
-    dailyRevenue.forEach((row) => {
-      if (!row._id) return;
-      const [year, month, day] = row._id.split('-').map(Number);
-      const timestamp = Date.UTC(year, month - 1, day);
-      const bucket = buckets.find((item) => timestamp >= item.start && timestamp < item.end);
-      if (bucket) {
-        bucket.revenue += row.revenue || 0;
-        bucket.count += row.count || 0;
-      }
-    });
 
     const methodStats = ALL_METHODS.map((method) => {
       const entry = methodIndex.get(method);
@@ -297,18 +196,14 @@ const getPaymentStats = async (req, res, next) => {
 
     return res.json({
       currency: 'ETB',
-      cards: {
-        totalRevenue: round2(revenueAgg[0]?.total || 0),
-        successfulPayments: paidCount,
-        pendingPayments: pendingCount,
-        failedPayments: failedCount,
-        refundedAmount: round2(refundAgg[0]?.total || 0),
-        codAwaitingCollection: round2(codAgg[0]?.total || 0),
-      },
+      cards: metrics.cards,
       methodStats,
       methodBreakdown: methodBreakdownWithOther.map((entry) => ({ ...entry, amount: round2(entry.amount) })),
-      trend: buckets.map(({ label, revenue, count }) => ({ label, revenue: round2(revenue), count })),
-      period,
+      trend: metrics.trend,
+      period: metrics.period,
+      previousRevenue: metrics.previousRevenue,
+      change: metrics.change,
+      ordersChange: metrics.ordersChange,
       recentTransactions: recentOrders.map(serializeTransaction),
     });
   } catch (error) {
@@ -325,6 +220,7 @@ const statusCondition = (status) => {
     case 'Paid':
       return { $or: [{ isPaid: true }, { paymentStatus: 'Paid' }] };
     case 'Awaiting Verification':
+    case 'Pending Verification':
       return { paymentStatus: { $in: ['Pending Verification', 'Awaiting Verification'] } };
     case 'Unpaid':
       return {
@@ -473,10 +369,10 @@ const getTransactionDetail = async (req, res, next) => {
       verification: {
         providerReference: order.paymentGatewayReference || '',
         gatewayResult: order.isPaid
-          ? 'Verified — payment confirmed by provider'
+          ? 'Payment verified and confirmed'
           : ['Failed', 'Cancelled'].includes(order.paymentStatus)
             ? `Provider reported ${order.paymentStatus.toLowerCase()}`
-            : 'Not verified with the provider',
+            : 'Awaiting administrator verification',
         receipt: order.paymentReceipt && order.paymentReceipt.storageKey
           ? {
             mimeType: order.paymentReceipt.mimeType,
@@ -516,11 +412,18 @@ const getBankTransfers = async (req, res, next) => {
       ? { paymentStatus: 'Rejected' }
       : status === 'reviewed'
         ? { paymentStatus: 'Paid' }
-        : { paymentStatus: { $in: ['Pending Verification', 'Awaiting Verification'] }, isPaid: { $ne: true } };
+        : {
+          paymentStatus: { $in: ['Pending Verification', 'Awaiting Verification'] },
+          isPaid: { $ne: true },
+          'paymentReceipt.storageKey': { $exists: true, $ne: '' },
+        };
 
-    const orders = await Order.find({ paymentMethod: 'Bank Transfer', ...statusFilter })
+    const orders = await Order.find({
+      paymentMethod: { $in: ALL_METHODS },
+      ...statusFilter,
+    })
       .populate('user', 'name email')
-      .sort({ paymentReceiptUploadedAt: -1, createdAt: -1 });
+      .sort({ 'paymentReceipt.uploadedAt': -1, createdAt: -1 });
     return res.json(orders.map(serializeTransaction));
   } catch (error) {
     return next(error);
@@ -636,6 +539,7 @@ function serializeRefund(refund) {
     refundNumber: refund.refundNumber,
     orderId: populatedOrder ? populatedOrder._id : refund.order,
     orderNumber: populatedOrder?.orderNumber || '',
+    returnRequestId: refund.returnRequest || null,
     transactionReference: refund.transactionReference || '',
     customerName: populatedUser?.name || '',
     customerEmail: populatedUser?.email || '',
@@ -646,6 +550,8 @@ function serializeRefund(refund) {
     currency: refund.currency || 'ETB',
     reason: refund.reason,
     status: refund.status,
+    source: refund.source || 'manual',
+    customerMessage: refund.customerMessage || '',
     providerRefundReference: refund.providerRefundReference || '',
     providerStatus: refund.providerStatus || '',
     requestedAt: refund.requestedAt || refund.createdAt,
@@ -653,6 +559,13 @@ function serializeRefund(refund) {
     reviewNote: refund.reviewNote || '',
     processedAt: refund.processedAt || null,
     processingNote: refund.processingNote || '',
+    failedAt: refund.failedAt || null,
+    history: (refund.history || []).map((entry) => ({
+      status: entry.status,
+      message: entry.message || '',
+      timestamp: entry.timestamp,
+      actorRole: entry.actorRole || 'system',
+    })),
   };
 }
 
@@ -717,7 +630,7 @@ const getRefundDetail = async (req, res, next) => {
 
 const createRefund = async (req, res, next) => {
   try {
-    const { orderId, amount, reason = '' } = req.body || {};
+    const { orderId, amount, reason = '', returnRequestId } = req.body || {};
     if (!mongoose.isValidObjectId(orderId)) {
       return res.status(400).json({ status: 'error', message: 'A valid order is required.' });
     }
@@ -726,6 +639,20 @@ const createRefund = async (req, res, next) => {
     }
     const order = await Order.findById(orderId);
     if (!order) return res.status(404).json({ status: 'error', message: 'Order not found.' });
+    let returnRequest;
+    if (returnRequestId !== undefined) {
+      if (!mongoose.isValidObjectId(returnRequestId)) {
+        return res.status(400).json({ status: 'error', message: 'A valid return request is required.' });
+      }
+      returnRequest = await ReturnRequest.findOne({
+        _id: returnRequestId,
+        order: order._id,
+        status: { $in: ['Item Received', 'Refund Processing'] },
+      });
+      if (!returnRequest) {
+        return res.status(409).json({ status: 'error', message: 'The return must be received and inspected before a refund can be created.' });
+      }
+    }
     if (!order.isPaid || !['Paid', 'Partially Refunded'].includes(effectiveStatus(order))) {
       return res.status(409).json({ status: 'error', message: 'Only successfully paid orders can be refunded.' });
     }
@@ -734,7 +661,7 @@ const createRefund = async (req, res, next) => {
     const alreadyRefunded = Number(order.refundedAmount) || 0;
     const activeRefund = await Refund.findOne({
       order: order._id,
-      status: { $in: ['Requested', 'Approved', 'Processing'] },
+      status: { $in: ['Refund Required', 'Pending', 'Requested', 'Approved', 'Processing'] },
     });
     if (activeRefund) {
       return res.status(409).json({ status: 'error', message: 'This order already has a refund in progress.' });
@@ -759,12 +686,28 @@ const createRefund = async (req, res, next) => {
       amount: refundAmount,
       currency: 'ETB',
       reason: reason.trim(),
-      status: 'Requested',
+      status: returnRequest ? 'Pending' : 'Requested',
+      source: returnRequest ? 'return' : 'manual',
+      returnRequest: returnRequest?._id,
       requestedAt: new Date(),
+      history: [{
+        status: returnRequest ? 'Pending' : 'Requested',
+        message: reason.trim() || 'Refund request created by an administrator.',
+        actor: req.user._id,
+        actorRole: 'admin',
+      }],
     });
     const populated = await Refund.findById(refund._id)
       .populate('order', 'orderNumber')
       .populate('user', 'name email');
+    await createNotification(refund.user, {
+      type: 'refund-update',
+      title: 'Refund update',
+      message: `A refund for order ${order.orderNumber} has been created and is awaiting review.`,
+      link: `/orders/${order._id}`,
+      relatedEntityType: 'refund',
+      relatedEntityId: refund._id,
+    });
     return res.status(201).json(serializeRefund(populated));
   } catch (error) {
     return next(error);
@@ -780,103 +723,164 @@ const reviewRefund = async (req, res, next) => {
     if (typeof note !== 'string' || note.length > 500) {
       return res.status(400).json({ status: 'error', message: 'Note must be no longer than 500 characters.' });
     }
-    if (decision === 'reject' && !note.trim()) {
-      return res.status(400).json({ status: 'error', message: 'A rejection reason is required.' });
+    if (!note.trim()) {
+      return res.status(400).json({ status: 'error', message: 'An explanation is required for this refund decision.' });
     }
+    const pendingRefund = await Refund.findOne({
+      _id: req.params.id,
+      status: { $in: ['Requested', 'Refund Required'] },
+    });
+    if (!pendingRefund) {
+      return res.status(409).json({ status: 'error', message: 'This refund is not awaiting review.' });
+    }
+    const nextStatus = decision === 'approve'
+      ? pendingRefund.status === 'Refund Required' ? 'Pending' : 'Approved'
+      : pendingRefund.status === 'Refund Required' ? 'Not Required' : 'Rejected';
     const refund = await Refund.findOneAndUpdate(
-      { _id: req.params.id, status: 'Requested' },
+      { _id: req.params.id, status: pendingRefund.status },
       {
         $set: {
-          status: decision === 'approve' ? 'Approved' : 'Rejected',
+          status: nextStatus,
           reviewNote: note.trim(),
+          customerMessage: note.trim(),
           reviewedAt: new Date(),
           reviewedBy: req.user._id,
+        },
+        $push: {
+          history: {
+            status: nextStatus,
+            message: note.trim() || (decision === 'approve' ? 'Refund approved for processing.' : 'Refund request declined.'),
+            actor: req.user._id,
+            actorRole: 'admin',
+          },
         },
       },
       { new: true }
     ).populate('order', 'orderNumber').populate('user', 'name email');
     if (!refund) return res.status(409).json({ status: 'error', message: 'This refund is not awaiting review.' });
+    await createNotification(refund.user._id, {
+      type: 'refund-update',
+      title: `Refund ${nextStatus.toLowerCase()}`,
+      message: note.trim(),
+      link: `/orders/${refund.order?._id || refund.order}`,
+      relatedEntityType: 'refund',
+      relatedEntityId: refund._id,
+    });
     return res.json(serializeRefund(refund));
   } catch (error) {
     return next(error);
   }
 };
 
-const applyRefundToOrder = async (orderId, amount) => {
-  const order = await Order.findById(orderId);
-  if (!order) return null;
-  const originalAmount = orderAmountEtb(order);
-  const totalRefunded = round2((Number(order.refundedAmount) || 0) + amount);
-  order.refundedAmount = totalRefunded;
-  order.paymentStatus = totalRefunded >= originalAmount - 0.005 ? 'Refunded' : 'Partially Refunded';
-  order.paymentHistory = order.paymentHistory || [];
-  order.paymentHistory.push(paymentHistoryEntry(order.paymentStatus, {
-    previousStatus: 'Paid',
-    message: `Refund of ${amount.toFixed(2)} ETB completed.`,
-    amount,
-  }));
-  await order.save();
-  return order;
-};
-
 const processRefund = async (req, res, next) => {
   try {
-    const { providerReference = '', note = '' } = req.body || {};
-    if (typeof providerReference !== 'string' || typeof note !== 'string') {
+    const { note = '', customerMessage = '', providerReference = '' } = req.body || {};
+    if (typeof note !== 'string' || typeof customerMessage !== 'string' || typeof providerReference !== 'string') {
       return res.status(400).json({ status: 'error', message: 'Invalid refund processing payload.' });
     }
-    if (providerReference.length > 200 || note.length > 500) {
-      return res.status(400).json({ status: 'error', message: 'Refund reference or note is too long.' });
+    if (note.length > 500 || customerMessage.length > 500 || providerReference.length > 200) {
+      return res.status(400).json({ status: 'error', message: 'Refund message is too long.' });
     }
 
-    const refund = await Refund.findOne({ _id: req.params.id, status: 'Approved' });
-    if (!refund) return res.status(409).json({ status: 'error', message: 'Only approved refunds can be processed.' });
+    const refund = await Refund.findOne({
+      _id: req.params.id,
+      status: { $in: ['Pending', 'Approved'] },
+    });
+    if (!refund) return res.status(409).json({ status: 'error', message: 'Only approved or pending refunds can be processed.' });
 
     const config = await resolvePaymentConfiguration();
     const isOnline = refund.paymentMethod === 'Chapa Checkout' || refund.paymentMethod === 'Credit Card';
     const canUseGateway = isOnline && config.gateway.configured && Boolean(refund.transactionReference);
+    const previousStatus = refund.status;
+    const processingAt = new Date();
+    const startedRefund = await Refund.findOneAndUpdate(
+      { _id: refund._id, status: previousStatus },
+      {
+        $set: {
+          status: 'Processing',
+          provider: canUseGateway ? 'Chapa' : refund.provider || providerLabel({ paymentMethod: refund.paymentMethod }),
+          processingNote: note.trim(),
+          customerMessage: customerMessage.trim(),
+          processedBy: req.user._id,
+          ...(providerReference.trim() ? { providerRefundReference: providerReference.trim() } : {}),
+        },
+        $push: {
+          history: {
+            status: 'Processing',
+            message: customerMessage.trim() || 'Refund processing has started.',
+            timestamp: processingAt,
+            actor: req.user._id,
+            actorRole: 'admin',
+          },
+        },
+      },
+      { new: true }
+    );
+    if (!startedRefund) {
+      return res.status(409).json({ status: 'error', message: 'This refund is already being processed.' });
+    }
+    await createNotification(startedRefund.user, {
+      type: 'refund-update',
+      title: 'Refund processing',
+      message: customerMessage.trim() || `Your refund ${startedRefund.refundNumber} is being processed.`,
+      link: `/orders/${startedRefund.order}`,
+      relatedEntityType: 'refund',
+      relatedEntityId: startedRefund._id,
+    });
 
     if (canUseGateway) {
-      const isFull = Math.abs(refund.amount - refund.originalAmount) < 0.005;
+      const isFull = Math.abs(startedRefund.amount - startedRefund.originalAmount) < 0.005;
       let providerData;
       try {
         providerData = await refundChapaTransaction({
-          txRef: refund.transactionReference,
-          amount: isFull ? undefined : refund.amount.toFixed(2),
-          reason: refund.reason,
-          reference: refund.refundNumber,
+          txRef: startedRefund.transactionReference,
+          amount: isFull ? undefined : startedRefund.amount.toFixed(2),
+          reason: startedRefund.reason,
+          reference: startedRefund.refundNumber,
         });
       } catch (error) {
+        const failureMessage = `The payment provider could not start this refund: ${error.message}`;
+        const failedRefund = await Refund.findOneAndUpdate(
+          { _id: startedRefund._id, status: 'Processing' },
+          {
+            $set: {
+              status: 'Failed',
+              failedAt: new Date(),
+              customerMessage: failureMessage.slice(0, 500),
+            },
+            $push: {
+              history: {
+                status: 'Failed',
+                message: failureMessage.slice(0, 500),
+                actor: req.user._id,
+                actorRole: 'admin',
+              },
+            },
+          },
+          { new: true }
+        );
+        if (!failedRefund) {
+          return res.status(409).json({ status: 'error', message: 'Refund state changed while contacting the payment provider.' });
+        }
+        await createNotification(failedRefund.user, {
+          type: 'refund-update',
+          title: 'Refund processing update',
+          message: failureMessage.slice(0, 500),
+          link: `/orders/${failedRefund.order}`,
+          relatedEntityType: 'refund',
+          relatedEntityId: failedRefund._id,
+        });
         return res.status(502).json({ status: 'error', message: `The payment provider could not start this refund: ${error.message}` });
       }
-      refund.status = 'Processing';
-      refund.provider = 'Chapa';
-      refund.providerRefundReference = providerData.ref || providerData.ref_id || providerData.chapa_reference || '';
-      refund.providerStatus = String(providerData.status || 'initiated');
-      refund.providerResponse = JSON.stringify(providerData).slice(0, 2000);
-      refund.processingNote = note.trim();
-      await refund.save();
-      const populated = await Refund.findById(refund._id).populate('order', 'orderNumber').populate('user', 'name email');
+      startedRefund.providerRefundReference = providerData.ref || providerData.ref_id || providerData.chapa_reference || '';
+      startedRefund.providerStatus = String(providerData.status || 'initiated');
+      startedRefund.providerResponse = JSON.stringify(providerData).slice(0, 2000);
+      await startedRefund.save();
+      const populated = await Refund.findById(startedRefund._id).populate('order', 'orderNumber').populate('user', 'name email');
       return res.json(serializeRefund(populated));
     }
 
-    // Manual completion (bank transfer, cash on delivery, or gateway not configured).
-    if (!providerReference.trim()) {
-      return res.status(400).json({
-        status: 'error',
-        message: 'Enter the refund reference confirming the refund was completed outside the gateway.',
-      });
-    }
-    refund.status = 'Refunded';
-    refund.provider = refund.provider || providerLabel(refund);
-    refund.providerRefundReference = providerReference.trim();
-    refund.providerStatus = 'refunded';
-    refund.processingNote = note.trim();
-    refund.processedAt = new Date();
-    refund.processedBy = req.user._id;
-    await refund.save();
-    await applyRefundToOrder(refund.order, refund.amount);
-    const populated = await Refund.findById(refund._id).populate('order', 'orderNumber').populate('user', 'name email');
+    const populated = await Refund.findById(startedRefund._id).populate('order', 'orderNumber').populate('user', 'name email');
     return res.json(serializeRefund(populated));
   } catch (error) {
     return next(error);
@@ -885,21 +889,132 @@ const processRefund = async (req, res, next) => {
 
 const completeRefund = async (req, res, next) => {
   try {
-    const { providerReference = '', note = '' } = req.body || {};
-    const refund = await Refund.findOne({ _id: req.params.id, status: 'Processing' });
-    if (!refund) return res.status(409).json({ status: 'error', message: 'Only refunds in processing can be completed.' });
-    if (typeof providerReference === 'string' && providerReference.trim()) {
-      refund.providerRefundReference = providerReference.trim();
+    const { providerReference = '', note = '', confirmedPaid = false } = req.body || {};
+    if (typeof providerReference !== 'string' || providerReference.length > 200 ||
+      typeof note !== 'string' || note.length > 500) {
+      return res.status(400).json({ status: 'error', message: 'Invalid refund completion details.' });
     }
-    refund.status = 'Refunded';
-    refund.providerStatus = 'refunded';
-    refund.processingNote = typeof note === 'string' ? note.trim() : '';
-    refund.processedAt = new Date();
-    refund.processedBy = req.user._id;
-    await refund.save();
-    await applyRefundToOrder(refund.order, refund.amount);
-    const populated = await Refund.findById(refund._id).populate('order', 'orderNumber').populate('user', 'name email');
+    if (confirmedPaid !== true) {
+      return res.status(400).json({ status: 'error', message: 'Confirm that the refund has actually been paid before completing it.' });
+    }
+    const session = await mongoose.startSession();
+    let completedId;
+    try {
+      await session.withTransaction(async () => {
+        const refund = await Refund.findOne({ _id: req.params.id, status: 'Processing' }).session(session);
+        if (!refund) throw Object.assign(new Error('Only refunds in processing can be completed.'), { statusCode: 409 });
+        const reference = providerReference.trim() || refund.providerRefundReference;
+        if (!reference) {
+          throw Object.assign(new Error('A refund transaction reference or receipt number is required.'), { statusCode: 400 });
+        }
+        const order = await Order.findById(refund.order).session(session);
+        if (!order) throw Object.assign(new Error('The original order could not be found.'), { statusCode: 404 });
+        const originalAmount = orderAmountEtb(order);
+        const totalRefunded = round2((Number(order.refundedAmount) || 0) + refund.amount);
+        if (totalRefunded > originalAmount + 0.005) {
+          throw Object.assign(new Error('Refund amount exceeds the remaining amount paid.'), { statusCode: 409 });
+        }
+        const previousPaymentStatus = effectiveStatus(order);
+        order.refundedAmount = totalRefunded;
+        order.paymentStatus = totalRefunded >= originalAmount - 0.005 ? 'Refunded' : 'Partially Refunded';
+        order.paymentHistory = order.paymentHistory || [];
+        order.paymentHistory.push(paymentHistoryEntry(order.paymentStatus, {
+          previousStatus: previousPaymentStatus,
+          message: `Refund of ${refund.amount.toFixed(2)} ETB completed.`,
+          amount: refund.amount,
+          adminUserId: req.user._id,
+        }));
+        refund.status = 'Refunded';
+        refund.providerRefundReference = reference;
+        refund.providerStatus = 'refunded';
+        refund.processingNote = note.trim();
+        refund.customerMessage = note.trim();
+        refund.processedAt = new Date();
+        refund.processedBy = req.user._id;
+        refund.history = refund.history || [];
+        refund.history.push({
+          status: 'Refunded',
+          message: note.trim() || 'Refund has been completed.',
+          timestamp: refund.processedAt,
+          actor: req.user._id,
+          actorRole: 'admin',
+        });
+        await order.save({ session });
+        await refund.save({ session });
+        if (refund.returnRequest) {
+          const returnRequest = await ReturnRequest.findById(refund.returnRequest).session(session);
+          if (returnRequest) {
+            returnRequest.status = 'Refunded';
+            returnRequest.adminResponse = note.trim() || 'The return refund has been completed.';
+            returnRequest.history = returnRequest.history || [];
+            returnRequest.history.push({
+              status: 'Refunded',
+              message: returnRequest.adminResponse,
+              timestamp: refund.processedAt,
+              actor: req.user._id,
+              actorRole: 'admin',
+            });
+            await returnRequest.save({ session });
+          }
+        }
+        completedId = refund._id;
+      });
+    } finally {
+      await session.endSession();
+    }
+    if (!completedId) throw new Error('Refund completion completed without updating the record.');
+    const populated = await Refund.findById(completedId).populate('order', 'orderNumber').populate('user', 'name email');
+    await createNotification(populated.user._id, {
+      type: 'refund-update',
+      title: 'Refund completed',
+      message: note.trim() || `Refund ${populated.refundNumber} has been marked complete after payment was returned.`,
+      link: `/orders/${populated.order?._id || populated.order}`,
+      relatedEntityType: 'refund',
+      relatedEntityId: populated._id,
+    });
     return res.json(serializeRefund(populated));
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const failRefund = async (req, res, next) => {
+  try {
+    const { reason, customerMessage = '' } = req.body || {};
+    if (typeof reason !== 'string' || !reason.trim() || reason.length > 500 ||
+      typeof customerMessage !== 'string' || customerMessage.length > 500) {
+      return res.status(400).json({ status: 'error', message: 'A failure explanation of up to 500 characters is required.' });
+    }
+    const refund = await Refund.findOneAndUpdate(
+      { _id: req.params.id, status: 'Processing' },
+      {
+        $set: {
+          status: 'Failed',
+          processingNote: reason.trim(),
+          customerMessage: customerMessage.trim() || reason.trim(),
+          failedAt: new Date(),
+        },
+        $push: {
+          history: {
+            status: 'Failed',
+            message: customerMessage.trim() || reason.trim(),
+            actor: req.user._id,
+            actorRole: 'admin',
+          },
+        },
+      },
+      { new: true }
+    ).populate('order', 'orderNumber').populate('user', 'name email');
+    if (!refund) return res.status(409).json({ status: 'error', message: 'Only refunds in processing can be marked failed.' });
+    await createNotification(refund.user._id, {
+      type: 'refund-update',
+      title: 'Refund processing update',
+      message: customerMessage.trim() || reason.trim(),
+      link: `/orders/${refund.order?._id || refund.order}`,
+      relatedEntityType: 'refund',
+      relatedEntityId: refund._id,
+    });
+    return res.json(serializeRefund(refund));
   } catch (error) {
     return next(error);
   }
@@ -919,16 +1034,18 @@ const getAdminPaymentSettings = async (req, res, next) => {
         method,
         enabled: config.methodEnabled[method],
         supported: config.methodSupported[method],
-        requiresGateway: ONLINE_METHODS.includes(method),
+        requiresGateway: false,
       })),
       disabledMethods: config.disabledMethods,
       bankTransfer: {
-        bankName: config.bankTransfer.bankName,
-        accountName: config.bankTransfer.accountName,
-        accountNumber: config.bankTransfer.accountNumber,
-        branch: config.bankTransfer.branch,
-        instructions: settings?.bankTransfer?.instructions || '',
-        configured: config.bankTransfer.configured,
+        ...config.bankTransfer,
+      },
+      telebirr: {
+        ...config.telebirr,
+      },
+      cbeBirr: {
+        ...config.cbeBirr,
+        configured: config.cbeBirr.configured,
       },
       updatedAt: settings?.updatedAt || null,
     });
@@ -939,7 +1056,7 @@ const getAdminPaymentSettings = async (req, res, next) => {
 
 const updateAdminPaymentSettings = async (req, res, next) => {
   try {
-    const { disabledMethods, bankTransfer } = req.body || {};
+    const { disabledMethods, bankTransfer, telebirr, cbeBirr } = req.body || {};
     const update = { updatedBy: req.user._id };
 
     if (disabledMethods !== undefined) {
@@ -953,22 +1070,38 @@ const updateAdminPaymentSettings = async (req, res, next) => {
       update.disabledMethods = [...new Set(disabledMethods)];
     }
 
-    if (bankTransfer !== undefined) {
-      if (!bankTransfer || typeof bankTransfer !== 'object' || Array.isArray(bankTransfer)) {
-        return res.status(400).json({ status: 'error', message: 'Bank transfer settings must be an object.' });
+    const accountFields = {
+      bankTransfer: {
+        value: bankTransfer,
+        fields: ['bankName', 'accountName', 'accountNumber', 'branch', 'instructions'],
+        limits: { bankName: 120, accountName: 120, accountNumber: 60, branch: 120, instructions: 1000 },
+      },
+      telebirr: {
+        value: telebirr,
+        fields: ['businessName', 'accountDetails', 'instructions'],
+        limits: { businessName: 120, accountDetails: 200, instructions: 1000 },
+      },
+      cbeBirr: {
+        value: cbeBirr,
+        fields: ['accountName', 'accountDetails', 'instructions'],
+        limits: { accountName: 120, accountDetails: 200, instructions: 1000 },
+      },
+    };
+    for (const [method, definition] of Object.entries(accountFields)) {
+      if (definition.value === undefined) continue;
+      if (!definition.value || typeof definition.value !== 'object' || Array.isArray(definition.value)) {
+        return res.status(400).json({ status: 'error', message: `${method} settings must be an object.` });
       }
-      const fields = ['bankName', 'accountName', 'accountNumber', 'branch', 'instructions'];
-      const limits = { bankName: 120, accountName: 120, accountNumber: 60, branch: 120, instructions: 1000 };
-      const bankTransferUpdate = {};
-      for (const field of fields) {
-        if (bankTransfer[field] === undefined) continue;
-        const value = bankTransfer[field];
-        if (typeof value !== 'string' || value.length > limits[field]) {
-          return res.status(400).json({ status: 'error', message: `${field} must be a string no longer than ${limits[field]} characters.` });
+      const methodUpdate = {};
+      for (const field of definition.fields) {
+        if (definition.value[field] === undefined) continue;
+        const value = definition.value[field];
+        if (typeof value !== 'string' || value.length > definition.limits[field]) {
+          return res.status(400).json({ status: 'error', message: `${field} must be a string no longer than ${definition.limits[field]} characters.` });
         }
-        bankTransferUpdate[field] = value.trim();
+        methodUpdate[field] = value.trim();
       }
-      update.bankTransfer = bankTransferUpdate;
+      update[method] = methodUpdate;
     }
 
     await PaymentSetting.findOneAndUpdate(
@@ -997,6 +1130,7 @@ module.exports = {
   reviewRefund,
   processRefund,
   completeRefund,
+  failRefund,
   getAdminPaymentSettings,
   updateAdminPaymentSettings,
 };

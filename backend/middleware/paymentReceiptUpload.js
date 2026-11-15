@@ -5,7 +5,6 @@ const allowedTypes = new Map([
   ['.jpg', 'image/jpeg'],
   ['.jpeg', 'image/jpeg'],
   ['.png', 'image/png'],
-  ['.webp', 'image/webp'],
   ['.pdf', 'application/pdf'],
 ]);
 
@@ -19,7 +18,7 @@ const upload = multer({
     const extension = path.extname(file.originalname).toLowerCase();
     if (allowedTypes.get(extension) === file.mimetype) return callback(null, true);
     return callback(Object.assign(
-      new Error('Payment receipts must be JPG, PNG, WebP, or PDF files.'),
+      new Error('Payment receipts must be JPG, JPEG, PNG, or PDF files.'),
       { statusCode: 400 }
     ));
   },
@@ -32,9 +31,7 @@ const hasValidReceiptSignature = (file) => {
   if (mimetype === 'image/png') {
     return buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
   }
-  return buffer.length >= 12 &&
-    buffer.toString('ascii', 0, 4) === 'RIFF' &&
-    buffer.toString('ascii', 8, 12) === 'WEBP';
+  return false;
 };
 
 module.exports = {
