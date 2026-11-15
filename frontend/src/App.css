@@ -5627,6 +5627,16 @@
   font-size: .77rem;
 }
 
+.order-payment-receipt-history,
+.pay-receipt-list {
+  display: grid;
+  gap: 6px;
+}
+
+.order-payment-receipt-history > strong {
+  font-size: .8rem;
+}
+
 .payment-receipt-status {
   margin: 0;
   color: var(--text-muted);

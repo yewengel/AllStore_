@@ -96,6 +96,19 @@ const paymentReceiptSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const paymentAccountSnapshotSchema = new mongoose.Schema(
+  {
+    name: { type: String, trim: true },
+    type: { type: String, enum: ['bank', 'mobile-money'] },
+    provider: { type: String, trim: true },
+    accountHolder: { type: String, trim: true },
+    accountDetails: { type: String, trim: true },
+    branch: { type: String, trim: true },
+    instructions: { type: String, trim: true },
+  },
+  { _id: false }
+);
+
 /**
  * Payment audit trail. Every payment status change or administrative action
  * is recorded here so administrators can review the full history of a payment.
@@ -174,6 +187,13 @@ const orderSchema = new mongoose.Schema(
       required: true,
       default: 'Credit Card',
     },
+    paymentAccountId: {
+      type: String,
+      trim: true,
+    },
+    paymentAccountSnapshot: {
+      type: paymentAccountSnapshotSchema,
+    },
     totalPrice: {
       type: Number,
       required: true,
@@ -228,6 +248,10 @@ const orderSchema = new mongoose.Schema(
     },
     paymentReceipt: {
       type: paymentReceiptSchema,
+    },
+    paymentReceiptHistory: {
+      type: [paymentReceiptSchema],
+      default: [],
     },
     paymentGatewayReference: {
       type: String,

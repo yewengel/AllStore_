@@ -1,82 +1,148 @@
 const mongoose = require('mongoose');
 const PaymentSetting = require('../models/PaymentSetting');
-const { getPaymentConfiguration } = require('./chapa');
 
-// Methods an administrator can enable/disable from the payment settings page.
-const PAYMENT_METHOD_KEYS = ['Bank Transfer', 'Telebirr', 'CBE Birr'];
+const LEGACY_METHODS = [
+  {
+    id: '000000000000000000000001',
+    name: 'Bank Transfer',
+    type: 'bank',
+    provider: (settings) => settings.bankTransfer?.bankName,
+    accountHolder: (settings) => settings.bankTransfer?.accountName,
+    accountDetails: (settings) => settings.bankTransfer?.accountNumber,
+    branch: (settings) => settings.bankTransfer?.branch,
+    instructions: (settings) => settings.bankTransfer?.instructions,
+    disabledKey: 'Bank Transfer',
+  },
+  {
+    id: '000000000000000000000002',
+    name: 'Telebirr',
+    type: 'mobile-money',
+    provider: () => 'Telebirr',
+    accountHolder: (settings) => settings.telebirr?.businessName,
+    accountDetails: (settings) => settings.telebirr?.accountDetails,
+    instructions: (settings) => settings.telebirr?.instructions,
+    disabledKey: 'Telebirr',
+  },
+  {
+    id: '000000000000000000000003',
+    name: 'CBE Birr',
+    type: 'mobile-money',
+    provider: () => 'CBE Birr',
+    accountHolder: (settings) => settings.cbeBirr?.accountName,
+    accountDetails: (settings) => settings.cbeBirr?.accountDetails,
+    instructions: (settings) => settings.cbeBirr?.instructions,
+    disabledKey: 'CBE Birr',
+  },
+];
 
-/**
- * Read the singleton payment settings document without making public checkout
- * requests create or modify settings.
- */
+const clean = (value) => typeof value === 'string' ? value.trim() : '';
+
+const isPaymentAccountComplete = (account) => Boolean(
+  clean(account?.name) &&
+  ['bank', 'mobile-money'].includes(account?.type) &&
+  clean(account?.provider) &&
+  clean(account?.accountHolder) &&
+  clean(account?.accountDetails)
+);
+
+const serializePaymentAccount = (account, fallbackId) => ({
+  id: String(account?._id || account?.id || fallbackId || ''),
+  name: clean(account?.name),
+  type: account?.type === 'mobile-money' ? 'mobile-money' : 'bank',
+  provider: clean(account?.provider),
+  accountHolder: clean(account?.accountHolder),
+  accountDetails: clean(account?.accountDetails),
+  branch: clean(account?.branch),
+  instructions: clean(account?.instructions),
+  active: Boolean(account?.active),
+});
+
+const legacyPaymentAccounts = (settings) => {
+  const disabled = new Set(settings?.disabledMethods || []);
+  return LEGACY_METHODS.flatMap((method) => {
+    const account = {
+      id: method.id,
+      name: method.name,
+      type: method.type,
+      provider: clean(method.provider(settings)),
+      accountHolder: clean(method.accountHolder(settings)),
+      accountDetails: clean(method.accountDetails(settings)),
+      branch: clean(method.branch?.(settings)),
+      instructions: clean(method.instructions(settings)),
+      active: false,
+    };
+    const hasLegacyData = [
+      account.provider,
+      account.accountHolder,
+      account.accountDetails,
+      account.branch,
+      account.instructions,
+    ].some(Boolean);
+    if (!hasLegacyData) return [];
+    account.active = !disabled.has(method.disabledKey) && isPaymentAccountComplete(account);
+    return [account];
+  });
+};
+
+const paymentAccountsFromSettings = (settings) => {
+  if (!settings) return [];
+  const storedAccounts = settings.accounts || [];
+  if (settings.accountsMigrated || storedAccounts.length > 0) {
+    return storedAccounts.map((account) => serializePaymentAccount(account));
+  }
+  return legacyPaymentAccounts(settings);
+};
+
 const getPaymentSettings = async () => {
   if (mongoose.connection.readyState !== 1) return null;
   return PaymentSetting.findOne({ key: 'payment' }).lean();
 };
 
-/**
- * Resolve only payment methods with complete administrator-entered details.
- */
-const resolvePaymentConfiguration = async () => {
-  const base = getPaymentConfiguration();
-  const settings = await getPaymentSettings();
-  const disabled = new Set(
-    (settings?.disabledMethods || []).filter((method) => PAYMENT_METHOD_KEYS.includes(method))
-  );
+const getPaymentAccounts = async () => paymentAccountsFromSettings(await getPaymentSettings());
 
-  const bankTransfer = {
-    bankName: settings?.bankTransfer?.bankName?.trim() || '',
-    accountName: settings?.bankTransfer?.accountName?.trim() || '',
-    accountNumber: settings?.bankTransfer?.accountNumber?.trim() || '',
-    branch: settings?.bankTransfer?.branch?.trim() || '',
-    instructions: settings?.bankTransfer?.instructions?.trim() || '',
-  };
-  const bankTransferConfigured = Boolean(
-    bankTransfer.bankName && bankTransfer.accountName && bankTransfer.accountNumber
-  );
-  const telebirr = {
-    businessName: settings?.telebirr?.businessName?.trim() || '',
-    accountDetails: settings?.telebirr?.accountDetails?.trim() || '',
-    instructions: settings?.telebirr?.instructions?.trim() || '',
-  };
-  const cbeBirr = {
-    accountName: settings?.cbeBirr?.accountName?.trim() || '',
-    accountDetails: settings?.cbeBirr?.accountDetails?.trim() || '',
-    instructions: settings?.cbeBirr?.instructions?.trim() || '',
-  };
-
-  const methodSupported = {
-    Telebirr: Boolean(telebirr.businessName && telebirr.accountDetails),
-    'CBE Birr': Boolean(cbeBirr.accountName && cbeBirr.accountDetails),
-    'Bank Transfer': bankTransferConfigured,
-  };
-
-  const methodEnabled = Object.fromEntries(
-    PAYMENT_METHOD_KEYS.map((method) => [
-      method,
-      methodSupported[method] && !disabled.has(method),
-    ])
-  );
-
-  return {
-    gateway: {
-      provider: 'Chapa',
-      configured: base.chapa.configured,
-      mode: base.chapa.mode,
-      message: base.chapa.message,
-      availableMethods: base.chapa.configured ? base.chapa.availableMethods : [],
-    },
-    bankTransfer: { ...bankTransfer, configured: bankTransferConfigured },
-    telebirr: { ...telebirr, configured: methodSupported.Telebirr },
-    cbeBirr: { ...cbeBirr, configured: methodSupported['CBE Birr'] },
-    disabledMethods: [...disabled],
-    methodSupported,
-    methodEnabled,
-  };
+const getPaymentAccount = async (accountId, { activeOnly = false } = {}) => {
+  if (typeof accountId !== 'string' || !accountId.trim()) return null;
+  const account = (await getPaymentAccounts()).find((entry) => entry.id === accountId.trim());
+  if (!account || !isPaymentAccountComplete(account) || (activeOnly && !account.active)) return null;
+  return account;
 };
 
+const getPublicPaymentAccounts = async () => (
+  (await getPaymentAccounts())
+    .filter((account) => account.active && isPaymentAccountComplete(account))
+    .map(({ id, name, type, provider, accountHolder, accountDetails, branch, instructions }) => ({
+      id,
+      name,
+      type,
+      provider,
+      accountHolder,
+      accountDetails,
+      branch,
+      instructions,
+    }))
+);
+
+const paymentAccountSnapshot = (account) => ({
+  name: account.name,
+  type: account.type,
+  provider: account.provider,
+  accountHolder: account.accountHolder,
+  accountDetails: account.accountDetails,
+  branch: account.branch,
+  instructions: account.instructions,
+});
+
+const legacyPaymentAccountDocuments = (settings) => legacyPaymentAccounts(settings)
+  .map(({ id, ...account }) => ({ _id: id, ...account }));
+
 module.exports = {
-  PAYMENT_METHOD_KEYS,
+  getPaymentAccounts,
+  getPaymentAccount,
   getPaymentSettings,
-  resolvePaymentConfiguration,
+  isPaymentAccountComplete,
+  legacyPaymentAccountDocuments,
+  paymentAccountSnapshot,
+  paymentAccountsFromSettings,
+  serializePaymentAccount,
+  getPublicPaymentAccounts,
 };

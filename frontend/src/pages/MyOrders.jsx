@@ -30,11 +30,8 @@ const orderDate = (value) => new Date(value).toLocaleString('en-US', {
   minute: '2-digit',
 });
 const canCancelOrder = (order) => {
-  const eligible = ['Pending', 'Confirmed'].includes(order.orderStatus) ||
+  return ['Pending', 'Confirmed'].includes(order.orderStatus) ||
     (order.orderStatus === 'Processing' && !order.shippingDate && !String(order.trackingNumber || '').trim());
-  const activeCheckout = order.paymentMethod === 'Chapa Checkout' &&
-    order.paymentStatus === 'Pending' && Boolean(order.paymentInitializedAt);
-  return eligible && !activeCheckout;
 };
 
 const MyOrders = () => {

@@ -1,20 +1,5 @@
 // Shared labels for customer payment history and order tracking.
 
-export const ONLINE_PAYMENT_OPTIONS = [
-  {
-    value: 'Telebirr',
-    label: 'Telebirr',
-    icon: '📱',
-    description: 'Pay to the store’s Telebirr account and submit your receipt',
-  },
-  {
-    value: 'CBE Birr',
-    label: 'CBE Birr',
-    icon: '📱',
-    description: 'Pay to the store’s CBE Birr account and submit your receipt',
-  },
-];
-
 export const paymentMethodLabel = (method) => method || 'Online Payment';
 
 // Human-readable payment status.

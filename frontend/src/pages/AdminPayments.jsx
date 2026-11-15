@@ -116,9 +116,12 @@ const StatCard = ({ label, value, note, tone }) => (
 
 const useReceiptOpener = (onToast) =>
   useCallback(
-    async (id) => {
+    async (id, historyIndex) => {
       try {
-        const response = await api.get(`/admin/payments/bank-transfers/${id}/receipt`, { responseType: 'blob' });
+        const response = await api.get(`/admin/payments/bank-transfers/${id}/receipt`, {
+          responseType: 'blob',
+          ...(historyIndex !== undefined ? { params: { historyIndex } } : {}),
+        });
         const url = URL.createObjectURL(response.data);
         window.open(url, '_blank', 'noopener,noreferrer');
         window.setTimeout(() => URL.revokeObjectURL(url), 60000);
@@ -503,15 +506,26 @@ const TransactionDetailsModal = ({ id, onClose, onToast }) => {
               <DetailRow label="Provider reference" value={detail.verification.providerReference || '—'} />
               <DetailRow label="Gateway verification" value={detail.verification.gatewayResult} />
               <DetailRow
-                label="Bank receipt"
+                label="Payment receipts"
                 value={
-                  detail.verification.receipt ? (
+                  detail.verification.receiptHistory?.length ? (
+                    <span className="pay-receipt-list">
+                      {detail.verification.receiptHistory.map((receipt, index) => (
+                        <button
+                          type="button"
+                          className="admin-text-button"
+                          key={`${receipt.uploadedAt || index}-${index}`}
+                          onClick={() => openReceipt(detail.transaction.id, index)}
+                        >
+                          View {receipt.originalName || `receipt ${index + 1}`} · {formatDateTime(receipt.uploadedAt)}
+                        </button>
+                      ))}
+                    </span>
+                  ) : detail.verification.receipt ? (
                     <button type="button" className="admin-text-button" onClick={() => openReceipt(detail.transaction.id)}>
                       View uploaded receipt
                     </button>
-                  ) : (
-                    '—'
-                  )
+                  ) : '—'
                 }
               />
               <DetailRow label="Verification date" value={formatDateTime(detail.verification.verifiedAt)} />
@@ -962,17 +976,9 @@ const RefundsPage = ({ onToast, onView }) => {
     }
   };
 
-  const GATEWAY_REFUND_METHODS = ['Chapa Checkout', 'Credit Card'];
-
   const process = async (refund) => {
-    const gatewayMethod = GATEWAY_REFUND_METHODS.includes(refund.paymentMethod);
-    let providerReference = '';
-    if (gatewayMethod) {
-      if (!window.confirm(`Send refund ${refund.refundNumber} (${money(refund.amount, refund.currency)}) to the payment provider?`)) return;
-    } else {
-      providerReference = window.prompt('Optional refund transfer reference or receipt number (this does not mark the refund paid):');
-      if (providerReference === null) return;
-    }
+    const providerReference = window.prompt('Optional refund transfer reference or receipt number (this does not mark the refund paid):');
+    if (providerReference === null) return;
     const customerMessage = window.prompt('Optional message for the customer about this refund:');
     if (customerMessage === null) return;
     setBusyId(refund.id);
@@ -981,9 +987,7 @@ const RefundsPage = ({ onToast, onView }) => {
         customerMessage: customerMessage.trim(),
         ...(providerReference.trim() ? { providerReference: providerReference.trim() } : {}),
       });
-      onToast?.(gatewayMethod
-        ? 'Refund submitted to the provider. Confirm settlement and record the payout reference before marking it complete.'
-        : 'Refund moved to Processing. Complete the external payout before recording its reference.');
+      onToast?.('Refund moved to Processing. Complete the external payout before recording its reference.');
       await load();
     } catch (error) {
       onToast?.(error.response?.data?.message || 'The refund could not be processed.', 'error');
@@ -1208,33 +1212,28 @@ const RefundsPage = ({ onToast, onView }) => {
 // Payment settings
 // ---------------------------------------------------------------------------
 
+const emptyPaymentAccount = () => ({
+  name: '',
+  type: 'bank',
+  provider: '',
+  accountHolder: '',
+  accountDetails: '',
+  branch: '',
+  instructions: '',
+  active: false,
+});
+
 const PaymentSettingsPage = ({ onToast }) => {
-  const [settings, setSettings] = useState(null);
+  const [accounts, setAccounts] = useState([]);
+  const [form, setForm] = useState(emptyPaymentAccount);
+  const [editingId, setEditingId] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [bankForm, setBankForm] = useState({ bankName: '', accountName: '', accountNumber: '', branch: '', instructions: '' });
-  const [telebirrForm, setTelebirrForm] = useState({ businessName: '', accountDetails: '', instructions: '' });
-  const [cbeBirrForm, setCbeBirrForm] = useState({ accountName: '', accountDetails: '', instructions: '' });
+  const [loadError, setLoadError] = useState('');
 
   const apply = useCallback((data) => {
-    setSettings(data);
-    setBankForm({
-      bankName: data.bankTransfer?.bankName || '',
-      accountName: data.bankTransfer?.accountName || '',
-      accountNumber: data.bankTransfer?.accountNumber || '',
-      branch: data.bankTransfer?.branch || '',
-      instructions: data.bankTransfer?.instructions || '',
-    });
-    setTelebirrForm({
-      businessName: data.telebirr?.businessName || '',
-      accountDetails: data.telebirr?.accountDetails || '',
-      instructions: data.telebirr?.instructions || '',
-    });
-    setCbeBirrForm({
-      accountName: data.cbeBirr?.accountName || '',
-      accountDetails: data.cbeBirr?.accountDetails || '',
-      instructions: data.cbeBirr?.instructions || '',
-    });
+    setAccounts(Array.isArray(data.accounts) ? data.accounts : []);
+    setLoadError('');
   }, []);
 
   const load = useCallback(async () => {
@@ -1243,157 +1242,197 @@ const PaymentSettingsPage = ({ onToast }) => {
       const { data } = await api.get('/payment-settings');
       apply(data);
     } catch (error) {
-      onToast?.(error.response?.data?.message || 'Payment settings could not be loaded.', 'error');
+      setLoadError(error.response?.data?.message || 'Payment accounts could not be loaded.');
     } finally {
       setLoading(false);
     }
-  }, [apply, onToast]);
+  }, [apply]);
 
   useEffect(() => {
     const timer = window.setTimeout(load, 0);
     return () => window.clearTimeout(timer);
   }, [load]);
 
-  const persist = async (payload, successMessage) => {
+  const resetForm = () => {
+    setForm(emptyPaymentAccount());
+    setEditingId('');
+  };
+
+  const saveAccount = async (event) => {
+    event.preventDefault();
     setSaving(true);
     try {
-      const { data } = await api.put('/payment-settings', payload);
+      const { data } = editingId
+        ? await api.put(`/payment-settings/accounts/${editingId}`, form)
+        : await api.post('/payment-settings/accounts', form);
       apply(data);
-      onToast?.(successMessage);
+      resetForm();
+      onToast?.(editingId ? 'Payment account updated.' : 'Payment account added.');
     } catch (error) {
-      onToast?.(error.response?.data?.message || 'Payment settings could not be saved.', 'error');
+      onToast?.(error.response?.data?.message || 'Payment account could not be saved.', 'error');
     } finally {
       setSaving(false);
     }
   };
 
-  const toggleMethod = (method) => {
-    const disabled = new Set(settings.disabledMethods || []);
-    if (disabled.has(method)) disabled.delete(method);
-    else disabled.add(method);
-    persist({ disabledMethods: [...disabled] }, `${method} has been updated.`);
+  const toggleAccount = async (account) => {
+    setSaving(true);
+    const { id, ...accountFields } = account;
+    try {
+      const { data } = await api.put(`/payment-settings/accounts/${id}`, {
+        ...accountFields,
+        active: !account.active,
+      });
+      apply(data);
+      onToast?.(account.active ? 'Payment account deactivated.' : 'Payment account activated.');
+    } catch (error) {
+      onToast?.(error.response?.data?.message || 'Payment account status could not be changed.', 'error');
+    } finally {
+      setSaving(false);
+    }
   };
 
-  if (loading || !settings) return <Loader label="Loading payment settings…" />;
+  const deleteAccount = async (account) => {
+    if (!window.confirm(`Delete ${account.name}? Existing orders will retain their payment account details.`)) return;
+    setSaving(true);
+    try {
+      const { data } = await api.delete(`/payment-settings/accounts/${account.id}`);
+      apply(data);
+      if (editingId === account.id) resetForm();
+      onToast?.('Payment account deleted.');
+    } catch (error) {
+      onToast?.(error.response?.data?.message || 'Payment account could not be deleted.', 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) return <Loader label="Loading payment accounts…" />;
 
   return (
     <>
+      {loadError && (
+        <div className="alert-error-banner" role="alert">
+          {loadError} <button type="button" className="admin-text-button" onClick={load}>Retry</button>
+        </div>
+      )}
       <section className="admin-panel">
         <div className="admin-panel-heading">
           <div>
             <h2>Manual payment verification</h2>
-            <p>Customers pay to your configured accounts and submit proof; admins verify payments manually.</p>
+            <p>Add bank or mobile money accounts customers can pay to. Submitted receipts remain pending until an administrator verifies the payment.</p>
           </div>
           <span className="pay-gateway-chip online">Admin verified</span>
         </div>
-        <p className="pay-muted pay-gateway-note">Payment account details are stored on the server and only shown to customers for active methods. Verify each submitted payment in the merchant account before confirming.</p>
+        <p className="pay-muted pay-gateway-note">Only active accounts with complete details appear at checkout. Account details are saved on the server and copied to each order for payment history.</p>
       </section>
 
       <section className="admin-panel">
         <div className="admin-panel-heading">
           <div>
-            <h2>Payment methods</h2>
-            <p>Enable or disable the payment methods customers can choose at checkout</p>
+            <h2>Payment accounts</h2>
+            <p>{accounts.length} configured account{accounts.length === 1 ? '' : 's'}</p>
           </div>
+          <button type="button" className="admin-primary-button" disabled={saving} onClick={resetForm}>Add payment account</button>
         </div>
-        <div className="pay-method-toggle-list">
-          {settings.methods.map((entry) => {
-            const blocked = !entry.supported;
-            return (
-              <div className="pay-method-toggle" key={entry.method}>
+        {accounts.length ? (
+          <div className="pay-method-toggle-list">
+            {accounts.map((account) => (
+              <article className="pay-method-toggle" key={account.id}>
                 <div>
-                  <MethodPill method={entry.method} />
+                  <strong>{account.name}</strong>
                   <span className="admin-cell-subtitle">
-                    {blocked
-                      ? 'Add the required account details below before enabling this method.'
-                      : 'Customers upload payment proof; your team verifies it manually.'}
+                    {account.type === 'bank' ? 'Bank' : 'Mobile money'} · {account.provider} · {account.accountHolder} · {account.accountDetails}
+                    {account.branch ? ` · ${account.branch}` : ''}
                   </span>
+                  <span className="admin-cell-subtitle">{account.active ? 'Active at customer checkout' : 'Inactive'}</span>
                 </div>
-                <button
-                  type="button"
-                  className={`pay-switch ${entry.enabled ? 'on' : 'off'}`}
-                  disabled={saving || blocked}
-                  aria-pressed={entry.enabled}
-                  onClick={() => toggleMethod(entry.method)}
-                >
-                  <span className="pay-switch-knob" />
-                  <span className="pay-switch-label">{entry.enabled ? 'Enabled' : 'Disabled'}</span>
-                </button>
-              </div>
-            );
-          })}
-        </div>
+                <div className="admin-modal-actions">
+                  <button
+                    type="button"
+                    className="admin-outline-button"
+                    disabled={saving}
+                    onClick={() => {
+                      const { id, ...accountFields } = account;
+                      setEditingId(id);
+                      setForm(accountFields);
+                    }}
+                  >
+                    Edit
+                  </button>
+                  <button type="button" className="admin-outline-button" disabled={saving} onClick={() => toggleAccount(account)}>
+                    {account.active ? 'Deactivate' : 'Activate'}
+                  </button>
+                  <button type="button" className="admin-outline-button danger" disabled={saving} onClick={() => deleteAccount(account)}>
+                    Delete
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <EmptyState title="No payment accounts yet" detail="Add a store-owned bank or mobile money account to make it available at checkout." />
+        )}
       </section>
 
       <section className="admin-panel">
         <div className="admin-panel-heading">
           <div>
-            <h2>Bank transfer settings</h2>
-            <p>Account details and instructions customers see when paying by bank transfer</p>
+            <h2>{editingId ? 'Edit payment account' : 'Add payment account'}</h2>
+            <p>Use the actual account details owned by the store; incomplete or inactive accounts are hidden from customers.</p>
           </div>
         </div>
-        <div className="pay-form">
+        <form className="pay-form" onSubmit={saveAccount}>
           <div className="admin-form-row">
-            <label>Bank name<input className="pay-input" value={bankForm.bankName} onChange={(event) => setBankForm((current) => ({ ...current, bankName: event.target.value }))} /></label>
-            <label>Account holder name<input className="pay-input" value={bankForm.accountName} onChange={(event) => setBankForm((current) => ({ ...current, accountName: event.target.value }))} /></label>
+            <label>
+              Account type
+              <select className="pay-input" value={form.type} onChange={(event) => setForm((current) => ({ ...current, type: event.target.value }))}>
+                <option value="bank">Bank</option>
+                <option value="mobile-money">Mobile money</option>
+              </select>
+            </label>
+            <label>
+              Checkout label
+              <input className="pay-input" maxLength="120" required value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} placeholder="For example: Bank Transfer" />
+            </label>
           </div>
           <div className="admin-form-row">
-            <label>Account number<input className="pay-input" value={bankForm.accountNumber} onChange={(event) => setBankForm((current) => ({ ...current, accountNumber: event.target.value }))} /></label>
-            <label>Branch<input className="pay-input" value={bankForm.branch} onChange={(event) => setBankForm((current) => ({ ...current, branch: event.target.value }))} /></label>
+            <label>
+              {form.type === 'bank' ? 'Bank name' : 'Mobile money provider'}
+              <input className="pay-input" maxLength="120" required value={form.provider} onChange={(event) => setForm((current) => ({ ...current, provider: event.target.value }))} />
+            </label>
+            <label>
+              Account holder / merchant name
+              <input className="pay-input" maxLength="120" required value={form.accountHolder} onChange={(event) => setForm((current) => ({ ...current, accountHolder: event.target.value }))} />
+            </label>
+          </div>
+          <div className="admin-form-row">
+            <label>
+              Account number / payment details
+              <input className="pay-input" maxLength="200" required value={form.accountDetails} onChange={(event) => setForm((current) => ({ ...current, accountDetails: event.target.value }))} />
+            </label>
+            {form.type === 'bank' && (
+              <label>
+                Branch (optional)
+                <input className="pay-input" maxLength="120" value={form.branch} onChange={(event) => setForm((current) => ({ ...current, branch: event.target.value }))} />
+              </label>
+            )}
           </div>
           <label>
             Payment instructions
-            <textarea className="pay-input" rows="3" value={bankForm.instructions} onChange={(event) => setBankForm((current) => ({ ...current, instructions: event.target.value }))} placeholder="e.g. Use your order number as the transfer reference." />
+            <textarea className="pay-input" rows="3" maxLength="1000" value={form.instructions} onChange={(event) => setForm((current) => ({ ...current, instructions: event.target.value }))} />
+          </label>
+          <label className="pay-method-toggle">
+            <span>Make this account active at checkout</span>
+            <input type="checkbox" checked={form.active} onChange={(event) => setForm((current) => ({ ...current, active: event.target.checked }))} />
           </label>
           <div className="admin-modal-actions">
-            <button type="button" className="admin-primary-button" disabled={saving} onClick={() => persist({ bankTransfer: bankForm }, 'Bank transfer settings saved.')}>
-              {saving ? 'Saving…' : 'Save bank transfer settings'}
+            {editingId && <button type="button" className="admin-outline-button" disabled={saving} onClick={resetForm}>Cancel edit</button>}
+            <button type="submit" className="admin-primary-button" disabled={saving}>
+              {saving ? 'Saving…' : editingId ? 'Save account' : 'Save payment account'}
             </button>
           </div>
-        </div>
-      </section>
-      <section className="admin-panel">
-        <div className="admin-panel-heading">
-          <div><h2>Telebirr details</h2><p>Enter the actual store-owned merchant name and Telebirr payment number/account.</p></div>
-        </div>
-        <div className="pay-form">
-          <div className="admin-form-row">
-            <label>Merchant or business name<input className="pay-input" value={telebirrForm.businessName} onChange={(event) => setTelebirrForm((current) => ({ ...current, businessName: event.target.value }))} /></label>
-            <label>Merchant payment number / account details<input className="pay-input" value={telebirrForm.accountDetails} onChange={(event) => setTelebirrForm((current) => ({ ...current, accountDetails: event.target.value }))} /></label>
-          </div>
-          <label>Payment instructions<textarea className="pay-input" rows="3" value={telebirrForm.instructions} onChange={(event) => setTelebirrForm((current) => ({ ...current, instructions: event.target.value }))} /></label>
-          <div className="admin-modal-actions"><button type="button" className="admin-primary-button" disabled={saving} onClick={() => persist({ telebirr: telebirrForm }, 'Telebirr settings saved.')}>{saving ? 'Saving…' : 'Save Telebirr settings'}</button></div>
-        </div>
-      </section>
-      <section className="admin-panel">
-        <div className="admin-panel-heading">
-          <div><h2>CBE Birr details</h2><p>Enter the actual store-owned CBE Birr account holder and account/merchant details.</p></div>
-        </div>
-        <div className="pay-form">
-          <div className="admin-form-row">
-            <label>Account holder name<input className="pay-input" value={cbeBirrForm.accountName} onChange={(event) => setCbeBirrForm((current) => ({ ...current, accountName: event.target.value }))} /></label>
-            <label>Account number / merchant details<input className="pay-input" value={cbeBirrForm.accountDetails} onChange={(event) => setCbeBirrForm((current) => ({ ...current, accountDetails: event.target.value }))} /></label>
-          </div>
-          <label>Payment instructions<textarea className="pay-input" rows="3" value={cbeBirrForm.instructions} onChange={(event) => setCbeBirrForm((current) => ({ ...current, instructions: event.target.value }))} /></label>
-          <div className="admin-modal-actions"><button type="button" className="admin-primary-button" disabled={saving} onClick={() => persist({ cbeBirr: cbeBirrForm }, 'CBE Birr settings saved.')}>{saving ? 'Saving…' : 'Save CBE Birr settings'}</button></div>
-        </div>
-      </section>
-      <section className="admin-panel">
-        <div className="admin-modal-actions">
-          <button
-            type="button"
-            className="admin-primary-button"
-            disabled={saving}
-            onClick={() => persist({
-              bankTransfer: bankForm,
-              telebirr: telebirrForm,
-              cbeBirr: cbeBirrForm,
-              disabledMethods: settings.disabledMethods || [],
-            }, 'Payment settings saved.')}
-          >
-            {saving ? 'Saving…' : 'Save Settings'}
-          </button>
-        </div>
+        </form>
       </section>
     </>
   );

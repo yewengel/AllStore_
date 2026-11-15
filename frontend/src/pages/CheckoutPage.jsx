@@ -5,7 +5,6 @@ import { useAuth } from '../context/AuthContext';
 import api, { getProductImageUrl } from '../api/axios';
 import { toEtb } from '../utils/currency';
 import { useCurrency } from '../context/CurrencyContext';
-import { ONLINE_PAYMENT_OPTIONS } from '../utils/payment';
 
 const FREE_SHIPPING_THRESHOLD = toEtb(100, 'USD');
 const STANDARD_SHIPPING_COST = toEtb(9.99, 'USD');
@@ -23,12 +22,13 @@ const CheckoutPage = () => {
   const [country, setCountry] = useState('Ethiopia');
   const [phoneNumber, setPhoneNumber] = useState(user?.phoneNumber || '');
   const [deliveryInstructions, setDeliveryInstructions] = useState('');
-  const [paymentMethod, setPaymentMethod] = useState('');
+  const [paymentAccountId, setPaymentAccountId] = useState('');
   const [transactionReference, setTransactionReference] = useState('');
   const [receiptFile, setReceiptFile] = useState(null);
 
   const [paymentConfig, setPaymentConfig] = useState(null);
   const [configLoaded, setConfigLoaded] = useState(false);
+  const [configError, setConfigError] = useState('');
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -41,34 +41,31 @@ const CheckoutPage = () => {
       .then(({ data }) => {
         if (!active) return;
         setPaymentConfig(data);
-        const configuredMethods = Object.keys(data?.paymentMethods || {});
-        setPaymentMethod(configuredMethods[0] || '');
+        setConfigError('');
+        const accounts = Array.isArray(data?.accounts) ? data.accounts : [];
+        setPaymentAccountId(accounts[0]?.id || '');
       })
-      .catch(() => { if (active) setPaymentConfig(null); })
+      .catch((requestError) => {
+        if (active) {
+          setPaymentConfig(null);
+          setConfigError(requestError.response?.data?.message || 'Payment options could not be loaded. Please try again later.');
+        }
+      })
       .finally(() => { if (active) setConfigLoaded(true); });
     return () => { active = false; };
   }, []);
 
-  const paymentMethods = useMemo(() => {
-    const configured = paymentConfig?.paymentMethods || {};
-    const methodDetails = {
-      'Bank Transfer': {
-        label: 'Bank Transfer',
-        icon: '🏦',
-        description: 'Transfer to the store bank account and submit your receipt.',
-      },
-      ...Object.fromEntries(ONLINE_PAYMENT_OPTIONS.map((option) => [option.value, option])),
-    };
-    return Object.entries(configured)
-      .filter(([, details]) => details && typeof details === 'object')
-      .map(([value, details]) => ({ value, ...methodDetails[value], details }));
-  }, [paymentConfig]);
+  const paymentAccounts = useMemo(
+    () => (Array.isArray(paymentConfig?.accounts) ? paymentConfig.accounts : [])
+      .filter((account) => account?.id && account.active),
+    [paymentConfig]
+  );
 
   const shippingCost = totalPrice >= FREE_SHIPPING_THRESHOLD ? 0 : STANDARD_SHIPPING_COST;
   const discount = 0;
   const grandTotal = Number((totalPrice + shippingCost - discount).toFixed(2));
 
-  const selectedMethod = paymentMethods.find((method) => method.value === paymentMethod);
+  const selectedAccount = paymentAccounts.find((account) => account.id === paymentAccountId);
 
   const handlePlaceOrder = async (e) => {
     e.preventDefault();
@@ -79,7 +76,7 @@ const CheckoutPage = () => {
       setError('Please fill in your phone number and all required shipping address fields.');
       return;
     }
-    if (!selectedMethod) {
+    if (!selectedAccount) {
       setError('There are no configured online payment methods available. Please contact the store.');
       return;
     }
@@ -105,7 +102,7 @@ const CheckoutPage = () => {
           country,
         },
         phoneNumber,
-        paymentMethod,
+        paymentAccountId,
         deliveryDetails: { region, deliveryInstructions },
         ...(transactionReference.trim() ? { transactionReference: transactionReference.trim() } : {}),
       };
@@ -304,54 +301,44 @@ const CheckoutPage = () => {
               <div className="payment-options">
                 <div className="payment-group">
                   <h3>Pay online (ETB)</h3>
-                  {paymentMethods.map((method) => (
+                  {paymentAccounts.map((account) => (
                     <label
-                      key={method.value}
-                      className={`payment-radio-label ${paymentMethod === method.value ? 'selected' : ''}`}
+                      key={account.id}
+                      className={`payment-radio-label ${paymentAccountId === account.id ? 'selected' : ''}`}
                     >
                       <input
                         type="radio"
-                        name="paymentMethod"
-                        value={method.value}
-                        checked={paymentMethod === method.value}
-                        onChange={(event) => setPaymentMethod(event.target.value)}
+                        name="paymentAccountId"
+                        value={account.id}
+                        checked={paymentAccountId === account.id}
+                        onChange={(event) => setPaymentAccountId(event.target.value)}
                       />
-                      <span className="payment-icon" aria-hidden="true">{method.icon}</span>
-                      <div><strong>{method.label}</strong><p>{method.description}</p></div>
+                      <span className="payment-icon" aria-hidden="true">{account.type === 'bank' ? '🏦' : '📱'}</span>
+                      <div><strong>{account.name}</strong><p>{account.provider} · {account.accountHolder}</p></div>
                     </label>
                   ))}
-                  {configLoaded && !paymentMethods.length && (
+                  {configLoaded && !paymentAccounts.length && (
                     <p className="payment-config-message">
-                      Online payment is not available yet. The store owner must configure a payment method.
+                      {configError || 'No payment accounts are available yet. The store owner must configure an active payment account.'}
                     </p>
                   )}
                 </div>
               </div>
 
-              {selectedMethod && (
+              {selectedAccount && (
                 <div className="bank-transfer-details" style={{ marginTop: '16px' }}>
-                  <h4>{selectedMethod.label} payment instructions</h4>
-                  {selectedMethod.value === 'Bank Transfer' && <>
-                    <p><span>Bank name</span><strong>{selectedMethod.details.bankName}</strong></p>
-                    <p><span>Account holder</span><strong>{selectedMethod.details.accountName}</strong></p>
-                    <p><span>Account number</span><strong>{selectedMethod.details.accountNumber}</strong></p>
-                    {selectedMethod.details.branch && <p><span>Branch</span><strong>{selectedMethod.details.branch}</strong></p>}
-                  </>}
-                  {selectedMethod.value === 'Telebirr' && <>
-                    <p><span>Business name</span><strong>{selectedMethod.details.businessName}</strong></p>
-                    <p><span>Merchant account / number</span><strong>{selectedMethod.details.accountDetails}</strong></p>
-                  </>}
-                  {selectedMethod.value === 'CBE Birr' && <>
-                    <p><span>Account holder</span><strong>{selectedMethod.details.accountName}</strong></p>
-                    <p><span>Account / merchant details</span><strong>{selectedMethod.details.accountDetails}</strong></p>
-                  </>}
-                  {selectedMethod.details.instructions && <p><span>Instructions</span><strong>{selectedMethod.details.instructions}</strong></p>}
+                  <h4>{selectedAccount.name} payment instructions</h4>
+                  <p><span>Provider</span><strong>{selectedAccount.provider}</strong></p>
+                  <p><span>Account holder / merchant</span><strong>{selectedAccount.accountHolder}</strong></p>
+                  <p><span>Account number / payment details</span><strong>{selectedAccount.accountDetails}</strong></p>
+                  {selectedAccount.branch && <p><span>Branch</span><strong>{selectedAccount.branch}</strong></p>}
+                  {selectedAccount.instructions && <p><span>Instructions</span><strong>{selectedAccount.instructions}</strong></p>}
                   <p><span>Exact amount</span><strong>{formatPrice(grandTotal, 'ETB')}</strong></p>
                   <small>Pay the exact amount using your banking or payment app, then submit a screenshot or receipt. Your order will not be processed until an Admin verifies the payment.</small>
                 </div>
               )}
 
-              {selectedMethod && (
+              {selectedAccount && (
                 <div className="form-group" style={{ marginTop: '16px' }}>
                   <label htmlFor="transactionReference">Payment Transaction Reference (if available)</label>
                   <input
@@ -366,7 +353,7 @@ const CheckoutPage = () => {
                 </div>
               )}
 
-              {selectedMethod && (
+              {selectedAccount && (
                 <div className="form-group">
                   <label htmlFor="receiptFile">Upload Payment Screenshot / Receipt (JPG, JPEG, PNG, or PDF) *</label>
                   <input
@@ -446,7 +433,7 @@ const CheckoutPage = () => {
               <button
                 type="submit"
                 form="checkout-form"
-                disabled={loading || !selectedMethod}
+                disabled={loading || !selectedAccount}
                 className="btn-primary btn-checkout-action"
               >
                 {loading ? 'Processing…' : placeOrderLabel}

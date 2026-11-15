@@ -79,12 +79,11 @@
 * Order statuses: `Pending`, `Confirmed`, `Processing`, `Shipped`, `Out for Delivery`, `Delivered`, and `Cancelled`.
 
 ### F. Payments
-* Customer checkout supports only configured, active Bank Transfer, Telebirr, and CBE Birr methods. Cash on Delivery is not accepted for new orders.
-* Configure store-owned payment destinations in Admin Dashboard → Payment Settings. Bank Transfer requires bank name, account holder, and account number; Telebirr requires a business name and merchant account/number; CBE Birr requires an account holder and account/merchant details. Instructions and bank branch are optional. No account credentials are seeded or supplied by the application.
+* Customer checkout supports only configured, active bank and mobile-money accounts. Cash on Delivery and Chapa checkout are not offered for new orders.
+* Add, edit, activate, deactivate, and delete store-owned payment accounts in Admin Dashboard → Payment Settings. Each account requires a checkout label, provider, account holder, and account details. Branch and payment instructions are optional. No account credentials are seeded or supplied by the application.
 * Customers pay the exact server-calculated order total, may enter a transaction reference, and must upload a JPG/JPEG, PNG, or PDF receipt (maximum 5 MB). Receipts are signature-checked and stored outside public static uploads. Uploading proof sets the payment to `Pending Verification`; it does not mark the order paid.
 * Only authenticated administrators can view receipts and confirm/reject submitted proofs. Confirmation records the administrator, date, and expected amount; rejection requires a customer-visible reason and permits corrected proof. Payment history stays on the MongoDB order record.
 * Payment and delivery statuses are separate. Unpaid/unverified orders cannot move to `Processing` or shipping. Verified orders count toward revenue; refunds remain incomplete until the actual payout is confirmed.
-* Chapa callback and verification routes remain for existing legacy orders. They are not offered as checkout methods.
 
 ### G. Customer Bonus Features
 * Customers can submit 1–5 star reviews only for products in their delivered orders. Reviews are unique per customer/product/order, start pending, and appear publicly only after Admin approval.

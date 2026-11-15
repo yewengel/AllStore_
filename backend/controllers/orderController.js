@@ -6,14 +6,18 @@ const Refund = require('../models/Refund');
 const ReturnRequest = require('../models/ReturnRequest');
 const { nextOrderNumber, nextRefundNumber } = require('../utils/orderNumbers');
 const { toEtb } = require('../utils/currency');
-const { resolvePaymentConfiguration } = require('../utils/paymentSettings');
+const {
+  getPaymentAccount,
+  getPaymentAccounts,
+  isPaymentAccountComplete,
+  paymentAccountSnapshot,
+} = require('../utils/paymentSettings');
 const { createNotification } = require('../utils/notifications');
 
 const requestError = (statusCode, message) => Object.assign(new Error(message), { statusCode });
 const FREE_SHIPPING_THRESHOLD_ETB = toEtb(100, 'USD');
 const SHIPPING_COST_ETB = toEtb(9.99, 'USD');
 const ORDER_STATUSES = ['Pending', 'Confirmed', 'Processing', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled'];
-const SUPPORTED_PAYMENT_METHODS = ['Bank Transfer', 'Telebirr', 'CBE Birr'];
 const CANCELLABLE_ORDER_STATUSES = ['Pending', 'Confirmed', 'Processing'];
 const ALLOWED_STATUS_TRANSITIONS = {
   Pending: ['Confirmed', 'Cancelled'],
@@ -202,6 +206,11 @@ const safeOrderSummary = (order, { includeAdminNotes = false } = {}) => {
       uploadedAt: summary.paymentReceipt.uploadedAt,
     };
   }
+  summary.paymentReceiptHistory = (summary.paymentReceiptHistory || []).map((receipt) => ({
+    mimeType: receipt.mimeType,
+    originalName: receipt.originalName,
+    uploadedAt: receipt.uploadedAt,
+  }));
   if (!includeAdminNotes) {
     delete summary.adminTrackingNote;
     summary.paymentHistory = (summary.paymentHistory || []).map((entry) => {
@@ -225,6 +234,7 @@ const createOrder = async (req, res, next) => {
     orderItems,
     shippingAddress,
     paymentMethod,
+    paymentAccountId,
     transactionReference,
     checkoutRequestKey,
     phoneNumber,
@@ -253,17 +263,23 @@ const createOrder = async (req, res, next) => {
       return next(error);
     }
   }
-  const normalizedPaymentMethod = requestedPaymentMethod;
-  const paymentConfiguration = await resolvePaymentConfiguration();
-  if (!SUPPORTED_PAYMENT_METHODS.includes(requestedPaymentMethod)) {
-    return res.status(400).json({ status: 'error', message: 'Select a supported payment method.' });
+  if (paymentAccountId !== undefined && (
+    typeof paymentAccountId !== 'string' || paymentAccountId.trim().length > 100
+  )) {
+    return res.status(400).json({ status: 'error', message: 'Select a valid payment account.' });
   }
-  // Enforce administrator payment method settings (methods disabled in the admin dashboard).
-  const requestedMethodKey = normalizedPaymentMethod;
-  if (requestedMethodKey && paymentConfiguration.methodEnabled[requestedMethodKey] === false) {
+  let selectedPaymentAccount = paymentAccountId
+    ? await getPaymentAccount(paymentAccountId, { activeOnly: true })
+    : null;
+  if (!selectedPaymentAccount && !paymentAccountId && requestedPaymentMethod) {
+    selectedPaymentAccount = (await getPaymentAccounts()).find(
+      (account) => account.active && isPaymentAccountComplete(account) && account.name === requestedPaymentMethod
+    );
+  }
+  if (!selectedPaymentAccount) {
     return res.status(400).json({
       status: 'error',
-      message: `The ${requestedMethodKey} payment method is currently unavailable.`,
+      message: 'Select a supported payment method using an active account configured by the store.',
     });
   }
   if (transactionReference !== undefined && (
@@ -446,7 +462,9 @@ const createOrder = async (req, res, next) => {
         deliveryCompany: DEFAULT_DELIVERY_COMPANY,
         currency: 'ETB',
         shippingAddress: normalizedShippingAddress,
-        paymentMethod: normalizedPaymentMethod,
+        paymentMethod: selectedPaymentAccount.name,
+        paymentAccountId: selectedPaymentAccount.id,
+        paymentAccountSnapshot: paymentAccountSnapshot(selectedPaymentAccount),
         paymentAmount: totalPrice,
         paymentCurrency: 'ETB',
         paymentStatus: 'Awaiting Payment',
@@ -455,7 +473,7 @@ const createOrder = async (req, res, next) => {
           message: 'Order created. Waiting for the customer to submit payment proof.',
           timestamp: new Date(),
         }],
-        paymentChannel: normalizedPaymentMethod,
+        paymentChannel: selectedPaymentAccount.provider,
         subtotal: Math.round((subtotal + Number.EPSILON) * 100) / 100,
         shippingCost,
         discountAmount: 0,
@@ -650,19 +668,6 @@ const updateOrderTracking = async (req, res, next) => {
         message: 'Payment must be verified and marked Paid before this order can be processed or shipped.',
       });
     }
-    if (
-      statusChanged &&
-      nextStatus === 'Cancelled' &&
-      order.paymentMethod === 'Chapa Checkout' &&
-      order.paymentStatus === 'Pending' &&
-      order.paymentInitializedAt
-    ) {
-      return res.status(409).json({
-        status: 'error',
-        message: 'This order has an active Chapa checkout. Verify or cancel the payment before cancelling the order.',
-      });
-    }
-
     const updates = {};
     const updateTimestamp = new Date();
     for (const field of Object.keys(textFields)) {
@@ -783,14 +788,6 @@ const cancelOrder = async (req, res, next) => {
       ) {
         throw requestError(409, 'This order can no longer be cancelled online. Please contact support for help.');
       }
-      if (
-        order.paymentMethod === 'Chapa Checkout' &&
-        order.paymentStatus === 'Pending' &&
-        order.paymentInitializedAt
-      ) {
-        throw requestError(409, 'This order has an active Chapa checkout. Verify or cancel the payment before cancelling the order.');
-      }
-
       const items = order.orderItems?.length ? order.orderItems : order.items || [];
       await restoreInventory(items, session);
 

@@ -21,13 +21,10 @@ const OrderDetailsPage = () => {
   const activeOrderId = useRef(id);
   const [actionError, setActionError] = useState(location.state?.paymentActionError || '');
   const [canceling, setCanceling] = useState(false);
-  const [paymentConfig, setPaymentConfig] = useState(null);
   const [paymentActionLoading, setPaymentActionLoading] = useState(false);
   const [receiptFile, setReceiptFile] = useState(null);
   const [transactionReference, setTransactionReference] = useState('');
   const [downloadingReceipt, setDownloadingReceipt] = useState(false);
-  const isChapaReturn = new URLSearchParams(location.search).get('payment') === 'chapa';
-  const isVerifyingPayment = isChapaReturn || paymentActionLoading;
   const loading = orderResult.id !== id;
   const order = loading ? null : orderResult.order;
   const error = loading ? '' : orderResult.error;
@@ -64,32 +61,6 @@ const OrderDetailsPage = () => {
 
   useOrderRefresh(() => loadOrder(true));
 
-  useEffect(() => {
-    api.get('/payment-settings/public')
-      .then(({ data }) => setPaymentConfig(data))
-      .catch(() => setPaymentConfig(null));
-  }, []);
-
-  useEffect(() => {
-    if (!isChapaReturn) return undefined;
-    let active = true;
-    api.post(`/payments/chapa/verify/${id}`)
-      .then(() => api.get(`/orders/${id}`))
-      .then(({ data }) => {
-        if (active) setOrderResult({ id, order: data, error: '' });
-      })
-      .catch((requestError) => {
-        if (active) setActionError(requestError.response?.data?.message || 'Payment verification is still pending. Refresh this page shortly.');
-      })
-      .finally(() => {
-        if (active) {
-          setPaymentActionLoading(false);
-          navigate(`/orders/${id}`, { replace: true });
-        }
-      });
-    return () => { active = false; };
-  }, [id, isChapaReturn, navigate]);
-
   const items = useMemo(() => order?.orderItems?.length
     ? order.orderItems
     : order?.items || [], [order]);
@@ -100,29 +71,14 @@ const OrderDetailsPage = () => {
   const subtotal = order?.subtotal ?? calculatedSubtotal;
   const discount = order?.discountAmount || 0;
   const deliveryFee = order?.shippingCost ?? Math.max(0, order?.totalPrice - subtotal + discount);
-  const activeCheckout = order?.paymentMethod === 'Chapa Checkout' &&
-    order?.paymentStatus === 'Pending' && Boolean(order?.paymentInitializedAt);
-  const canCancel = !activeCheckout && (
+  const canCancel = (
     ['Pending', 'Confirmed'].includes(order?.orderStatus) ||
     (order?.orderStatus === 'Processing' && !order?.shippingDate && !String(order?.trackingNumber || '').trim())
   );
   const paymentStatus = order?.isPaid ? 'Paid' : order?.paymentStatus || 'Pending';
-  const canPayOnline = order?.paymentMethod === 'Chapa Checkout' && ['Pending', 'Failed'].includes(paymentStatus);
-  const canSubmitReceipt = ['Bank Transfer', 'Telebirr', 'CBE Birr'].includes(order?.paymentMethod) &&
+  const canSubmitReceipt = (order?.paymentAccountId || order?.paymentAccountSnapshot ||
+    ['Bank Transfer', 'Telebirr', 'CBE Birr'].includes(order?.paymentMethod)) &&
     ['Awaiting Payment', 'Pending', 'Pending Verification', 'Rejected'].includes(paymentStatus) && !order?.isPaid;
-
-  const handlePayNow = async () => {
-    try {
-      setPaymentActionLoading(true);
-      setActionError('');
-      const { data } = await api.post(`/payments/chapa/initialize/${id}`);
-      window.location.assign(data.checkoutUrl);
-    } catch (requestError) {
-      setActionError(requestError.response?.data?.message || 'Secure Chapa checkout could not be opened.');
-    } finally {
-      setPaymentActionLoading(false);
-    }
-  };
 
   const handleReceiptUpload = async (event) => {
     event.preventDefault();
@@ -170,15 +126,20 @@ const OrderDetailsPage = () => {
     }
   };
 
-  const handleDownloadReceipt = async () => {
+  const handleDownloadReceipt = async (historyIndex) => {
     try {
       setDownloadingReceipt(true);
       setActionError('');
-      const response = await api.get(`/payments/bank-transfer/${id}/receipt`, { responseType: 'blob' });
+      const response = await api.get(`/payments/bank-transfer/${id}/receipt`, {
+        responseType: 'blob',
+        ...(historyIndex !== undefined ? { params: { historyIndex } } : {}),
+      });
       const url = URL.createObjectURL(response.data);
       const link = document.createElement('a');
       link.href = url;
-      link.download = order?.paymentReceipt?.originalName || 'payment-receipt';
+      link.download = order?.paymentReceiptHistory?.[historyIndex]?.originalName
+        || order?.paymentReceipt?.originalName
+        || 'payment-receipt';
       document.body.appendChild(link);
       link.click();
       link.remove();
@@ -319,17 +280,32 @@ const OrderDetailsPage = () => {
                   ))}
                 </div>
               )}
-              {order.paymentReceipt ? (
+              {order.paymentReceiptHistory?.length ? (
+                <div className="order-payment-receipt-history">
+                  <strong>Payment proof history</strong>
+                  {order.paymentReceiptHistory.map((receipt, index) => (
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      key={`${receipt.uploadedAt || index}-${index}`}
+                      onClick={() => handleDownloadReceipt(index)}
+                      disabled={downloadingReceipt}
+                    >
+                      {downloadingReceipt ? 'Preparing…' : `Download ${receipt.originalName || `receipt ${index + 1}`} · ${formatDate(receipt.uploadedAt)}`}
+                    </button>
+                  ))}
+                </div>
+              ) : order.paymentReceipt ? (
                 <button
                   type="button"
                   className="btn-secondary"
-                  onClick={handleDownloadReceipt}
+                  onClick={() => handleDownloadReceipt()}
                   disabled={downloadingReceipt}
                 >
                   {downloadingReceipt ? 'Preparing…' : 'Download payment receipt'}
                 </button>
               ) : (
-                <p className="payment-receipt-status">No bank receipt on file.</p>
+                <p className="payment-receipt-status">No payment receipt on file.</p>
               )}
             </section>
 
@@ -337,22 +313,20 @@ const OrderDetailsPage = () => {
               <h2>Need help?</h2>
               <Link to={`/orders/track/${order._id}`} className="btn-primary">Track Order</Link>
               <a className="btn-secondary" href={`mailto:${SUPPORT_EMAIL}?subject=${encodeURIComponent(`Help with order ${orderId}`)}`}>Contact Support</a>
-              {canPayOnline && (
-                <button type="button" className="btn-primary" onClick={handlePayNow} disabled={isVerifyingPayment}>
-                  {isVerifyingPayment ? 'Verifying payment…' : `Pay Now (${formatPrice(order.paymentAmount ?? order.totalPrice, order.paymentCurrency || order.currency)})`}
-                </button>
-              )}
               {order.paymentReceipt && (
                 <p className="payment-receipt-status">Payment proof submitted: {order.paymentReceipt.originalName || 'Payment receipt'}</p>
               )}
               {canSubmitReceipt && (
                 <form className="order-payment-receipt-form" onSubmit={handleReceiptUpload}>
-                  {paymentConfig?.paymentMethods?.[order.paymentMethod] && (
+                  {order.paymentAccountSnapshot && (
                     <div className="order-bank-account">
-                      <strong>{order.paymentMethod} payment details</strong>
-                      {Object.entries(paymentConfig.paymentMethods[order.paymentMethod])
-                        .filter(([key, value]) => key !== 'configured' && value)
-                        .map(([key, value]) => <span key={key}>{key}: {value}</span>)}
+                      <strong>{order.paymentAccountSnapshot.name} payment details</strong>
+                      <span>Provider: {order.paymentAccountSnapshot.provider}</span>
+                      <span>Account holder / merchant: {order.paymentAccountSnapshot.accountHolder}</span>
+                      <span>Account number / payment details: {order.paymentAccountSnapshot.accountDetails}</span>
+                      {order.paymentAccountSnapshot.branch && <span>Branch: {order.paymentAccountSnapshot.branch}</span>}
+                      {order.paymentAccountSnapshot.instructions && <span>Instructions: {order.paymentAccountSnapshot.instructions}</span>}
+                      <span>Exact amount: {formatPrice(order.paymentAmount ?? order.totalPrice, order.paymentCurrency || order.currency)}</span>
                     </div>
                   )}
                   <label htmlFor="order-payment-reference">Payment transaction reference (if available)</label>
@@ -366,9 +340,6 @@ const OrderDetailsPage = () => {
               )}
               {order.paymentStatus === 'Rejected' && order.paymentReviewNote && (
                 <p className="payment-receipt-status">Payment rejected: {order.paymentReviewNote}</p>
-              )}
-              {isVerifyingPayment && isChapaReturn && (
-                <p className="payment-receipt-status" role="status">Verifying payment securely with Chapa…</p>
               )}
               {canCancel && (
                 <button type="button" className="btn-cancel-order" onClick={handleCancelOrder} disabled={canceling}>

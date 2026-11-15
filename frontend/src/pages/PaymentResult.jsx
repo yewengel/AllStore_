@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Link, useLocation, useParams } from 'react-router-dom';
+import { Link, useParams } from 'react-router-dom';
 import api, { getProductImageUrl } from '../api/axios';
 import { useCurrency } from '../context/CurrencyContext';
 import {
@@ -15,8 +15,8 @@ const formatDate = (value) => value
 const OUTCOMES = {
   success: {
     icon: '✓',
-    title: 'Payment Successful',
-    message: 'Your payment was verified and confirmed by our server. Thank you for your purchase.',
+    title: 'Payment Confirmed',
+    message: 'Your payment was verified by our team. Thank you for your purchase.',
   },
   pending: {
     icon: '⏳',
@@ -26,7 +26,7 @@ const OUTCOMES = {
   failed: {
     icon: '✕',
     title: 'Payment Failed',
-    message: 'We could not confirm this payment. No amount was charged. You can retry from your order.',
+    message: 'Your payment proof was rejected. Review the reason and upload corrected proof from your order.',
   },
   cancelled: {
     icon: '⊘',
@@ -37,46 +37,24 @@ const OUTCOMES = {
 
 const PaymentResult = () => {
   const { id } = useParams();
-  const location = useLocation();
   const { formatPrice } = useCurrency();
-  const isChapaReturn = new URLSearchParams(location.search).get('payment') === 'chapa';
 
   const [order, setOrder] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [verifying, setVerifying] = useState(isChapaReturn);
   const [error, setError] = useState('');
 
   useEffect(() => {
     let active = true;
-    const run = async () => {
-      // Never trust the browser redirect: re-verify the payment on the server.
-      if (isChapaReturn) {
-        try {
-          await api.post(`/payments/chapa/verify/${id}`);
-        } catch (verifyError) {
-          if (active) {
-            setError(verifyError.response?.data?.message
-              || 'We could not verify this payment yet. It may still be processing.');
-          }
-        }
-      }
-      try {
-        const { data } = await api.get(`/orders/${id}`);
-        if (active) setOrder(data);
-      } catch (fetchError) {
-        if (active) {
-          setError(fetchError.response?.data?.message || 'Order details could not be loaded.');
-        }
-      } finally {
-        if (active) {
-          setVerifying(false);
-          setLoading(false);
-        }
-      }
-    };
-    void run();
+    api.get(`/orders/${id}`)
+      .then(({ data }) => { if (active) setOrder(data); })
+      .catch((fetchError) => {
+        if (active) setError(fetchError.response?.data?.message || 'Order details could not be loaded.');
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
     return () => { active = false; };
-  }, [id, isChapaReturn, location.key]);
+  }, [id]);
 
   const outcome = useMemo(() => {
     if (!order) return 'pending';
@@ -127,7 +105,6 @@ const PaymentResult = () => {
           <h1 className="payment-result-title">{details.title}</h1>
           <p className="payment-result-message">{outcomeMessage}</p>
 
-          {verifying && <p className="payment-result-verifying" role="status">Verifying with the payment gateway…</p>}
           {error && <p className="payment-result-note" role="alert">{error}</p>}
 
           <div className="payment-result-grid">

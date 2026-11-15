@@ -8,11 +8,12 @@ const { toEtb } = require('../utils/currency');
 const { calculateFinancialMetrics } = require('../utils/financialAnalytics');
 const { nextRefundNumber } = require('../utils/orderNumbers');
 const { createNotification } = require('../utils/notifications');
-const { refundChapaTransaction } = require('../utils/chapa');
 const { paymentHistoryEntry } = require('./paymentController');
 const {
-  PAYMENT_METHOD_KEYS,
-  resolvePaymentConfiguration,
+  getPaymentSettings,
+  isPaymentAccountComplete,
+  legacyPaymentAccountDocuments,
+  paymentAccountsFromSettings,
 } = require('../utils/paymentSettings');
 
 const ALL_METHODS = ['Telebirr', 'CBE Birr', 'Bank Transfer'];
@@ -113,6 +114,11 @@ const serializeTransaction = (order) => ({
       uploadedAt: order.paymentReceipt.uploadedAt,
     }
     : null,
+  receiptHistory: (order.paymentReceiptHistory || []).map((receipt) => ({
+    mimeType: receipt.mimeType,
+    originalName: receipt.originalName,
+    uploadedAt: receipt.uploadedAt,
+  })),
   refundedAmount: Number(order.refundedAmount) || 0,
   codCollectionStatus: order.codCollectionStatus || 'Pending',
 });
@@ -380,6 +386,11 @@ const getTransactionDetail = async (req, res, next) => {
             uploadedAt: order.paymentReceipt.uploadedAt,
           }
           : null,
+        receiptHistory: (order.paymentReceiptHistory || []).map((receipt) => ({
+          mimeType: receipt.mimeType,
+          originalName: receipt.originalName,
+          uploadedAt: receipt.uploadedAt,
+        })),
         verifiedAt: order.paymentDate || order.paidAt || null,
         reviewedAt: order.paymentReviewedAt || null,
         reviewedBy: order.paymentReviewedBy || null,
@@ -415,12 +426,19 @@ const getBankTransfers = async (req, res, next) => {
         : {
           paymentStatus: { $in: ['Pending Verification', 'Awaiting Verification'] },
           isPaid: { $ne: true },
-          'paymentReceipt.storageKey': { $exists: true, $ne: '' },
         };
 
     const orders = await Order.find({
-      paymentMethod: { $in: ALL_METHODS },
-      ...statusFilter,
+      $and: [
+        {
+          $or: [
+            { paymentAccountId: { $exists: true, $ne: '' } },
+            { paymentMethod: { $in: ['Bank Transfer', 'Telebirr', 'CBE Birr'] } },
+          ],
+        },
+        statusFilter,
+        { 'paymentReceipt.storageKey': { $exists: true, $ne: '' } },
+      ],
     })
       .populate('user', 'name email')
       .sort({ 'paymentReceipt.uploadedAt': -1, createdAt: -1 });
@@ -788,9 +806,6 @@ const processRefund = async (req, res, next) => {
     });
     if (!refund) return res.status(409).json({ status: 'error', message: 'Only approved or pending refunds can be processed.' });
 
-    const config = await resolvePaymentConfiguration();
-    const isOnline = refund.paymentMethod === 'Chapa Checkout' || refund.paymentMethod === 'Credit Card';
-    const canUseGateway = isOnline && config.gateway.configured && Boolean(refund.transactionReference);
     const previousStatus = refund.status;
     const processingAt = new Date();
     const startedRefund = await Refund.findOneAndUpdate(
@@ -798,7 +813,7 @@ const processRefund = async (req, res, next) => {
       {
         $set: {
           status: 'Processing',
-          provider: canUseGateway ? 'Chapa' : refund.provider || providerLabel({ paymentMethod: refund.paymentMethod }),
+          provider: refund.provider || providerLabel({ paymentMethod: refund.paymentMethod }),
           processingNote: note.trim(),
           customerMessage: customerMessage.trim(),
           processedBy: req.user._id,
@@ -827,58 +842,6 @@ const processRefund = async (req, res, next) => {
       relatedEntityType: 'refund',
       relatedEntityId: startedRefund._id,
     });
-
-    if (canUseGateway) {
-      const isFull = Math.abs(startedRefund.amount - startedRefund.originalAmount) < 0.005;
-      let providerData;
-      try {
-        providerData = await refundChapaTransaction({
-          txRef: startedRefund.transactionReference,
-          amount: isFull ? undefined : startedRefund.amount.toFixed(2),
-          reason: startedRefund.reason,
-          reference: startedRefund.refundNumber,
-        });
-      } catch (error) {
-        const failureMessage = `The payment provider could not start this refund: ${error.message}`;
-        const failedRefund = await Refund.findOneAndUpdate(
-          { _id: startedRefund._id, status: 'Processing' },
-          {
-            $set: {
-              status: 'Failed',
-              failedAt: new Date(),
-              customerMessage: failureMessage.slice(0, 500),
-            },
-            $push: {
-              history: {
-                status: 'Failed',
-                message: failureMessage.slice(0, 500),
-                actor: req.user._id,
-                actorRole: 'admin',
-              },
-            },
-          },
-          { new: true }
-        );
-        if (!failedRefund) {
-          return res.status(409).json({ status: 'error', message: 'Refund state changed while contacting the payment provider.' });
-        }
-        await createNotification(failedRefund.user, {
-          type: 'refund-update',
-          title: 'Refund processing update',
-          message: failureMessage.slice(0, 500),
-          link: `/orders/${failedRefund.order}`,
-          relatedEntityType: 'refund',
-          relatedEntityId: failedRefund._id,
-        });
-        return res.status(502).json({ status: 'error', message: `The payment provider could not start this refund: ${error.message}` });
-      }
-      startedRefund.providerRefundReference = providerData.ref || providerData.ref_id || providerData.chapa_reference || '';
-      startedRefund.providerStatus = String(providerData.status || 'initiated');
-      startedRefund.providerResponse = JSON.stringify(providerData).slice(0, 2000);
-      await startedRefund.save();
-      const populated = await Refund.findById(startedRefund._id).populate('order', 'orderNumber').populate('user', 'name email');
-      return res.json(serializeRefund(populated));
-    }
 
     const populated = await Refund.findById(startedRefund._id).populate('order', 'orderNumber').populate('user', 'name email');
     return res.json(serializeRefund(populated));
@@ -1026,27 +989,9 @@ const failRefund = async (req, res, next) => {
 
 const getAdminPaymentSettings = async (req, res, next) => {
   try {
-    const config = await resolvePaymentConfiguration();
-    const settings = await PaymentSetting.findOne({ key: 'payment' }).lean();
+    const settings = await getPaymentSettings();
     return res.json({
-      gateway: config.gateway,
-      methods: PAYMENT_METHOD_KEYS.map((method) => ({
-        method,
-        enabled: config.methodEnabled[method],
-        supported: config.methodSupported[method],
-        requiresGateway: false,
-      })),
-      disabledMethods: config.disabledMethods,
-      bankTransfer: {
-        ...config.bankTransfer,
-      },
-      telebirr: {
-        ...config.telebirr,
-      },
-      cbeBirr: {
-        ...config.cbeBirr,
-        configured: config.cbeBirr.configured,
-      },
+      accounts: paymentAccountsFromSettings(settings),
       updatedAt: settings?.updatedAt || null,
     });
   } catch (error) {
@@ -1054,64 +999,161 @@ const getAdminPaymentSettings = async (req, res, next) => {
   }
 };
 
+const PAYMENT_ACCOUNT_LIMITS = {
+  name: 120,
+  provider: 120,
+  accountHolder: 120,
+  accountDetails: 200,
+  branch: 120,
+  instructions: 1000,
+};
+
+const normalizePaymentAccount = (input, existing = {}) => {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return { error: 'Payment account settings must be an object.' };
+  }
+  const allowedFields = new Set([...Object.keys(PAYMENT_ACCOUNT_LIMITS), 'type', 'active']);
+  const unknownFields = Object.keys(input).filter((field) => !allowedFields.has(field));
+  if (unknownFields.length) return { error: `Unknown payment account field: ${unknownFields.join(', ')}.` };
+
+  const account = { ...existing };
+  for (const [field, maxLength] of Object.entries(PAYMENT_ACCOUNT_LIMITS)) {
+    if (input[field] === undefined) continue;
+    if (typeof input[field] !== 'string' || input[field].length > maxLength) {
+      return { error: `${field} must be a string no longer than ${maxLength} characters.` };
+    }
+    account[field] = input[field].trim();
+  }
+  if (input.type !== undefined) account.type = input.type;
+  if (!['bank', 'mobile-money'].includes(account.type)) {
+    return { error: 'Payment account type must be bank or mobile-money.' };
+  }
+  if (input.active !== undefined) {
+    if (typeof input.active !== 'boolean') return { error: 'Payment account active status must be true or false.' };
+    account.active = input.active;
+  } else {
+    account.active = Boolean(account.active);
+  }
+
+  const requiredFields = ['name', 'provider', 'accountHolder', 'accountDetails'];
+  const missingFields = requiredFields.filter((field) => !String(account[field] || '').trim());
+  if (missingFields.length) return { error: `Complete these payment account fields: ${missingFields.join(', ')}.` };
+  if (account.active && !isPaymentAccountComplete(account)) {
+    return { error: 'Complete the payment account details before activating it.' };
+  }
+
+  return {
+    account: {
+      name: account.name.trim(),
+      type: account.type,
+      provider: account.provider.trim(),
+      accountHolder: account.accountHolder.trim(),
+      accountDetails: account.accountDetails.trim(),
+      branch: String(account.branch || '').trim(),
+      instructions: String(account.instructions || '').trim(),
+      active: account.active,
+    },
+  };
+};
+
+const getEditablePaymentSettings = async () => {
+  let settings = await PaymentSetting.findOne({ key: 'payment' });
+  if (!settings) {
+    settings = new PaymentSetting({ key: 'payment', accountsMigrated: true });
+  } else if (!settings.accountsMigrated) {
+    if (!settings.accounts?.length) {
+      settings.accounts = legacyPaymentAccountDocuments(settings);
+    }
+    settings.accountsMigrated = true;
+  }
+  return settings;
+};
+
+const paymentSettingsResponse = (settings) => ({
+  accounts: paymentAccountsFromSettings(settings),
+  updatedAt: settings.updatedAt || null,
+});
+
+const createPaymentAccount = async (req, res, next) => {
+  try {
+    const result = normalizePaymentAccount(req.body);
+    if (result.error) return res.status(400).json({ status: 'error', message: result.error });
+
+    const settings = await getEditablePaymentSettings();
+    settings.accounts.push(result.account);
+    settings.accountsMigrated = true;
+    settings.updatedBy = req.user._id;
+    await settings.save();
+    return res.status(201).json(paymentSettingsResponse(settings));
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const updatePaymentAccount = async (req, res, next) => {
+  try {
+    const settings = await getEditablePaymentSettings();
+    const account = settings.accounts.id(req.params.id);
+    if (!account) return res.status(404).json({ status: 'error', message: 'Payment account not found.' });
+
+    const result = normalizePaymentAccount(req.body, account.toObject());
+    if (result.error) return res.status(400).json({ status: 'error', message: result.error });
+    Object.assign(account, result.account);
+    settings.updatedBy = req.user._id;
+    await settings.save();
+    return res.json(paymentSettingsResponse(settings));
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const deletePaymentAccount = async (req, res, next) => {
+  try {
+    const settings = await getEditablePaymentSettings();
+    const account = settings.accounts.id(req.params.id);
+    if (!account) return res.status(404).json({ status: 'error', message: 'Payment account not found.' });
+
+    account.deleteOne();
+    settings.updatedBy = req.user._id;
+    await settings.save();
+    return res.json(paymentSettingsResponse(settings));
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const updateAdminPaymentSettings = async (req, res, next) => {
   try {
-    const { disabledMethods, bankTransfer, telebirr, cbeBirr } = req.body || {};
-    const update = { updatedBy: req.user._id };
-
-    if (disabledMethods !== undefined) {
-      if (!Array.isArray(disabledMethods)) {
-        return res.status(400).json({ status: 'error', message: 'Disabled methods must be an array.' });
-      }
-      const invalid = disabledMethods.filter((method) => !PAYMENT_METHOD_KEYS.includes(method));
-      if (invalid.length) {
-        return res.status(400).json({ status: 'error', message: `Unknown payment method: ${invalid.join(', ')}.` });
-      }
-      update.disabledMethods = [...new Set(disabledMethods)];
+    const { accounts } = req.body || {};
+    if (!Array.isArray(accounts) || accounts.length > 50) {
+      return res.status(400).json({ status: 'error', message: 'Provide up to 50 payment accounts.' });
     }
 
-    const accountFields = {
-      bankTransfer: {
-        value: bankTransfer,
-        fields: ['bankName', 'accountName', 'accountNumber', 'branch', 'instructions'],
-        limits: { bankName: 120, accountName: 120, accountNumber: 60, branch: 120, instructions: 1000 },
-      },
-      telebirr: {
-        value: telebirr,
-        fields: ['businessName', 'accountDetails', 'instructions'],
-        limits: { businessName: 120, accountDetails: 200, instructions: 1000 },
-      },
-      cbeBirr: {
-        value: cbeBirr,
-        fields: ['accountName', 'accountDetails', 'instructions'],
-        limits: { accountName: 120, accountDetails: 200, instructions: 1000 },
-      },
-    };
-    for (const [method, definition] of Object.entries(accountFields)) {
-      if (definition.value === undefined) continue;
-      if (!definition.value || typeof definition.value !== 'object' || Array.isArray(definition.value)) {
-        return res.status(400).json({ status: 'error', message: `${method} settings must be an object.` });
+    const settings = await getEditablePaymentSettings();
+    const existing = new Map(settings.accounts.map((account) => [account._id.toString(), account]));
+    const replacement = [];
+    for (const entry of accounts) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        return res.status(400).json({ status: 'error', message: 'Each payment account must be an object.' });
       }
-      const methodUpdate = {};
-      for (const field of definition.fields) {
-        if (definition.value[field] === undefined) continue;
-        const value = definition.value[field];
-        if (typeof value !== 'string' || value.length > definition.limits[field]) {
-          return res.status(400).json({ status: 'error', message: `${field} must be a string no longer than ${definition.limits[field]} characters.` });
-        }
-        methodUpdate[field] = value.trim();
+      const { id, ...input } = entry;
+      const current = id ? existing.get(String(id)) : null;
+      if (id && !current) {
+        return res.status(400).json({ status: 'error', message: 'A payment account ID does not belong to this store.' });
       }
-      update[method] = methodUpdate;
+      const result = normalizePaymentAccount(input, current?.toObject() || {});
+      if (result.error) return res.status(400).json({ status: 'error', message: result.error });
+      replacement.push({
+        ...(current ? { _id: current._id } : {}),
+        ...result.account,
+      });
     }
 
-    await PaymentSetting.findOneAndUpdate(
-      { key: 'payment' },
-      { $set: update, $setOnInsert: { key: 'payment' } },
-      { new: true, upsert: true, setDefaultsOnInsert: true }
-    );
-
-    // Return the freshly resolved configuration.
-    return getAdminPaymentSettings(req, res, next);
+    settings.accounts = replacement;
+    settings.accountsMigrated = true;
+    settings.updatedBy = req.user._id;
+    await settings.save();
+    return res.json(paymentSettingsResponse(settings));
   } catch (error) {
     return next(error);
   }
@@ -1133,4 +1175,7 @@ module.exports = {
   failRefund,
   getAdminPaymentSettings,
   updateAdminPaymentSettings,
+  createPaymentAccount,
+  updatePaymentAccount,
+  deletePaymentAccount,
 };

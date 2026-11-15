@@ -1,27 +1,20 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 require('./helpers/mockNotifications');
-const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const mongoose = require('mongoose');
 const Order = require('../models/Order');
 const PaymentSetting = require('../models/PaymentSetting');
 const {
-  getPaymentConfig,
   getPublicPaymentSettings,
-  initializeChapaPayment,
-  updateChapaPaymentFromProvider,
-  handleChapaWebhook,
   uploadBankTransferReceipt,
   reviewBankTransfer,
 } = require('../controllers/paymentController');
 const {
   getAdminPaymentSettings,
-  updateAdminPaymentSettings,
+  createPaymentAccount,
 } = require('../controllers/adminPaymentController');
-const { getPaymentConfiguration } = require('../utils/chapa');
-const { resolvePaymentConfiguration } = require('../utils/paymentSettings');
 
 const receiptDirectory = path.join(__dirname, '..', 'private', 'payment-receipts');
 const createResponse = () => ({
@@ -36,714 +29,274 @@ const createResponse = () => ({
     this.body = body;
     return this;
   },
-  setHeader(name, value) {
-    this.headers[name] = value;
-  },
   set(name, value) {
     this.headers[name] = value;
     return this;
   },
 });
 
-const setChapaEnvironment = () => {
-  const keys = ['CHAPA_MODE', 'CHAPA_SECRET_KEY', 'CHAPA_WEBHOOK_SECRET', 'API_PUBLIC_URL', 'CLIENT_URL'];
-  const original = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
-  process.env.CHAPA_MODE = 'test';
-  process.env.CHAPA_SECRET_KEY = 'CHASECK_TEST-test-only-key';
-  process.env.CHAPA_WEBHOOK_SECRET = 'test-only-webhook-secret';
-  process.env.API_PUBLIC_URL = 'https://payments.example.test';
-  process.env.CLIENT_URL = 'https://allstore.example.test';
-  return () => keys.forEach((key) => {
-    if (original[key] === undefined) delete process.env[key];
-    else process.env[key] = original[key];
-  });
-};
-
-test('payment configuration never exposes secrets and disables incomplete gateway setup', async () => {
-  const restore = setChapaEnvironment();
-  const originalWebhookSecret = process.env.CHAPA_WEBHOOK_SECRET;
-  try {
-    delete process.env.CHAPA_WEBHOOK_SECRET;
-    const config = getPaymentConfiguration();
-    assert.equal(config.chapa.configured, false);
-    assert.match(config.chapa.message, /CHAPA_WEBHOOK_SECRET/);
-    const response = createResponse();
-    await getPaymentConfig({}, response, (error) => { throw error; });
-    assert.equal(Object.hasOwn(response.body.chapa, 'secretKey'), false);
-    assert.equal(Object.hasOwn(response.body.chapa, 'webhookSecret'), false);
-  } finally {
-    if (originalWebhookSecret === undefined) delete process.env.CHAPA_WEBHOOK_SECRET;
-    else process.env.CHAPA_WEBHOOK_SECRET = originalWebhookSecret;
-    restore();
-  }
-});
-
-test('only active methods with administrator-entered payment details are enabled', async () => {
-  const keys = ['CHAPA_MODE', 'CHAPA_SECRET_KEY', 'CHAPA_WEBHOOK_SECRET', 'API_PUBLIC_URL', 'CHAPA_AVAILABLE_METHODS'];
-  const original = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
-  const originalReadyState = mongoose.connection.readyState;
-  const originalFindOne = PaymentSetting.findOne;
-  process.env.CHAPA_MODE = 'test';
-  process.env.CHAPA_SECRET_KEY = 'CHASECK_TEST-test-only-key';
-  process.env.CHAPA_WEBHOOK_SECRET = 'test-only-webhook-secret';
-  process.env.API_PUBLIC_URL = 'https://payments.example.test';
-  process.env.CHAPA_AVAILABLE_METHODS = '';
-
-  try {
-    mongoose.connection.readyState = 1;
-    let settings = { disabledMethods: [] };
-    PaymentSetting.findOne = () => ({ lean: async () => settings });
-    const emptyConfiguration = await resolvePaymentConfiguration();
-    assert.equal(emptyConfiguration.methodEnabled['Bank Transfer'], false);
-    assert.equal(emptyConfiguration.methodEnabled.Telebirr, false);
-    assert.equal(emptyConfiguration.methodEnabled['CBE Birr'], false);
-
-    settings = {
-      disabledMethods: [],
-      bankTransfer: { bankName: 'Test Bank', accountName: 'Test Store', accountNumber: 'test-bank-account' },
-      telebirr: { businessName: 'Test Store', accountDetails: 'test-telebirr-account' },
-      cbeBirr: { accountName: 'Test Store', accountDetails: 'test-cbe-account' },
-    };
-    const configured = await resolvePaymentConfiguration();
-    assert.deepEqual(configured.methodEnabled, { 'Bank Transfer': true, Telebirr: true, 'CBE Birr': true });
-
-    settings.disabledMethods = ['Telebirr'];
-    const inactive = await resolvePaymentConfiguration();
-    assert.equal(inactive.methodEnabled.Telebirr, false);
-    assert.equal(inactive.methodEnabled['CBE Birr'], true);
-  } finally {
-    mongoose.connection.readyState = originalReadyState;
-    PaymentSetting.findOne = originalFindOne;
-    keys.forEach((key) => {
-      if (original[key] === undefined) delete process.env[key];
-      else process.env[key] = original[key];
-    });
-  }
-});
-
-test('public payment settings return only active customer instructions', async () => {
+test('public payment settings expose only complete active account details', async () => {
   const originalReadyState = mongoose.connection.readyState;
   const originalFindOne = PaymentSetting.findOne;
   try {
     mongoose.connection.readyState = 1;
     PaymentSetting.findOne = () => ({
       lean: async () => ({
-        disabledMethods: ['Telebirr'],
-        bankTransfer: {
-          bankName: 'Test Bank',
-          accountName: 'Test Store',
-          accountNumber: 'test-bank-account',
-          branch: 'Main',
-          instructions: 'Use the order number.',
-        },
-        telebirr: { businessName: 'Test Store', accountDetails: 'inactive-test-account' },
-        cbeBirr: { accountName: '', accountDetails: '' },
+        accountsMigrated: true,
+        accounts: [
+          {
+            _id: new mongoose.Types.ObjectId(),
+            name: 'Store Bank',
+            type: 'bank',
+            provider: 'Test Bank',
+            accountHolder: 'Store Owner',
+            accountDetails: 'test-account-123',
+            instructions: 'Use order number as reference.',
+            active: true,
+          },
+          {
+            _id: new mongoose.Types.ObjectId(),
+            name: 'Inactive account',
+            type: 'mobile-money',
+            provider: 'Provider',
+            accountHolder: 'Store Owner',
+            accountDetails: 'inactive-account',
+            active: false,
+          },
+          {
+            _id: new mongoose.Types.ObjectId(),
+            name: 'Incomplete account',
+            type: 'bank',
+            provider: '',
+            accountHolder: 'Store Owner',
+            accountDetails: 'incomplete-account',
+            active: true,
+          },
+        ],
       }),
     });
 
     const response = createResponse();
     await getPublicPaymentSettings({}, response, (error) => { throw error; });
 
-    assert.deepEqual(response.body, {
-      currency: 'ETB',
-      paymentMethods: {
-        'Bank Transfer': {
-          bankName: 'Test Bank',
-          accountName: 'Test Store',
-          accountNumber: 'test-bank-account',
-          branch: 'Main',
-          instructions: 'Use the order number.',
-        },
-      },
-    });
+    assert.equal(response.body.currency, 'ETB');
+    assert.equal(response.body.accounts.length, 1);
+    assert.equal(response.body.accounts[0].name, 'Store Bank');
+    assert.equal(response.body.accounts[0].accountDetails, 'test-account-123');
+    assert.equal(JSON.stringify(response.body).includes('inactive-account'), false);
+    assert.equal(JSON.stringify(response.body).includes('incomplete-account'), false);
     assert.equal(response.headers['Cache-Control'], 'no-store');
-    assert.equal(JSON.stringify(response.body).includes('inactive-test-account'), false);
   } finally {
     mongoose.connection.readyState = originalReadyState;
     PaymentSetting.findOne = originalFindOne;
   }
 });
 
-test('admin payment settings report CBE completeness from the CBE fields', async () => {
+test('Admin settings load configured accounts and reject incomplete active accounts', async () => {
   const originalReadyState = mongoose.connection.readyState;
-  const originalFindOneAndUpdate = PaymentSetting.findOneAndUpdate;
   const originalFindOne = PaymentSetting.findOne;
-  const savedSettings = {
-    disabledMethods: [],
-    bankTransfer: { bankName: '', accountName: '', accountNumber: '' },
-    telebirr: { businessName: '', accountDetails: '' },
-    cbeBirr: { accountName: 'Test Store', accountDetails: 'test-cbe-account' },
-  };
+  const accountId = new mongoose.Types.ObjectId();
   try {
     mongoose.connection.readyState = 1;
-    PaymentSetting.findOneAndUpdate = () => ({ lean: async () => savedSettings });
-    PaymentSetting.findOne = () => ({ lean: async () => savedSettings });
+    PaymentSetting.findOne = () => ({
+      lean: async () => ({
+        accountsMigrated: true,
+        accounts: [{
+          _id: accountId,
+          name: 'Store Bank',
+          type: 'bank',
+          provider: 'Test Bank',
+          accountHolder: 'Store Owner',
+          accountDetails: 'test-account-123',
+          active: true,
+        }],
+      }),
+    });
 
-    const response = createResponse();
-    await getAdminPaymentSettings({}, response, (error) => { throw error; });
+    const readResponse = createResponse();
+    await getAdminPaymentSettings({}, readResponse, (error) => { throw error; });
+    assert.equal(readResponse.body.accounts[0].id, accountId.toString());
 
-    assert.equal(response.body.bankTransfer.configured, false);
-    assert.equal(response.body.cbeBirr.configured, true);
-    assert.equal(response.body.methods.find(({ method }) => method === 'CBE Birr').supported, true);
-  } finally {
-    mongoose.connection.readyState = originalReadyState;
-    PaymentSetting.findOneAndUpdate = originalFindOneAndUpdate;
-    PaymentSetting.findOne = originalFindOne;
-  }
-});
-
-test('admin can save shared payment settings and receives the persisted configuration', async () => {
-  const originalReadyState = mongoose.connection.readyState;
-  const originalFindOneAndUpdate = PaymentSetting.findOneAndUpdate;
-  const originalFindOne = PaymentSetting.findOne;
-  let savedSettings = { key: 'payment', disabledMethods: [] };
-  let writeCount = 0;
-  try {
-    mongoose.connection.readyState = 1;
-    PaymentSetting.findOneAndUpdate = (_filter, update) => {
-      if (update.$set) {
-        savedSettings = { ...savedSettings, ...update.$set };
-        writeCount += 1;
-      }
-      return { lean: async () => savedSettings };
-    };
-    PaymentSetting.findOne = () => ({ lean: async () => savedSettings });
-
-    const response = createResponse();
-    await updateAdminPaymentSettings({
+    const writeResponse = createResponse();
+    await createPaymentAccount({
+      body: { name: 'Incomplete', type: 'bank', provider: '', active: true },
       user: { _id: new mongoose.Types.ObjectId() },
+    }, writeResponse, (error) => { throw error; });
+    assert.equal(writeResponse.statusCode, 400);
+  } finally {
+    mongoose.connection.readyState = originalReadyState;
+    PaymentSetting.findOne = originalFindOne;
+  }
+});
+
+test('Admin can persist an active store-owned account without environment credentials', async () => {
+  const originalFindOne = PaymentSetting.findOne;
+  const originalSave = PaymentSetting.prototype.save;
+  try {
+    PaymentSetting.findOne = async () => null;
+    PaymentSetting.prototype.save = async function save() { return this; };
+
+    const response = createResponse();
+    await createPaymentAccount({
       body: {
-        bankTransfer: {
-          bankName: 'Test Bank',
-          accountName: 'Test Store',
-          accountNumber: 'test-bank-account',
-          branch: '',
-          instructions: 'Use the order number.',
-        },
-        disabledMethods: [],
+        name: 'Store Mobile Money',
+        type: 'mobile-money',
+        provider: 'Test Provider',
+        accountHolder: 'Store Owner',
+        accountDetails: 'test-merchant-account',
+        instructions: 'Use the order number.',
+        active: true,
       },
+      user: { _id: new mongoose.Types.ObjectId() },
     }, response, (error) => { throw error; });
 
-    assert.equal(writeCount, 1);
-    assert.equal(response.body.bankTransfer.accountNumber, 'test-bank-account');
-    assert.equal(response.body.methods.find(({ method }) => method === 'Bank Transfer').enabled, true);
+    assert.equal(response.statusCode, 201);
+    assert.equal(response.body.accounts.length, 1);
+    assert.equal(response.body.accounts[0].name, 'Store Mobile Money');
+    assert.equal(response.body.accounts[0].active, true);
+    assert.equal(response.body.accounts[0].accountDetails, 'test-merchant-account');
   } finally {
-    mongoose.connection.readyState = originalReadyState;
-    PaymentSetting.findOneAndUpdate = originalFindOneAndUpdate;
     PaymentSetting.findOne = originalFindOne;
+    PaymentSetting.prototype.save = originalSave;
   }
 });
 
-test('Chapa initialization uses server-held credentials and returns only the secure checkout URL', async () => {
-  const restore = setChapaEnvironment();
+test('receipt submission waits for verification and Admin approval is single-use', async () => {
   const originalFindOne = Order.findOne;
-  const originalFetch = global.fetch;
+  const originalFindOneAndUpdate = Order.findOneAndUpdate;
   const orderId = new mongoose.Types.ObjectId();
   const customerId = new mongoose.Types.ObjectId();
+  const adminId = new mongoose.Types.ObjectId();
   const order = {
     _id: orderId,
-    orderNumber: 'AS-00125',
-    paymentMethod: 'Chapa Checkout',
-    paymentStatus: 'Pending',
-    paymentAmount: 125.5,
+    user: customerId,
+    orderNumber: 'AS-00999',
+    paymentAccountId: 'configured-account-id',
+    paymentMethod: 'Store Bank',
+    paymentStatus: 'Awaiting Payment',
+    totalPrice: 42,
     paymentCurrency: 'ETB',
-    transactionReference: 'AS-PAY-test-ref',
     isPaid: false,
+    orderStatus: 'Pending',
+    paymentHistory: [],
     save: async () => order,
   };
-  let request;
-  Order.findOne = () => ({ select: async () => order });
-  global.fetch = async (url, options) => {
-    request = { url, options };
-    return { ok: true, json: async () => ({ status: 'success', data: { checkout_url: 'https://checkout.chapa.co/checkout/payment/test' } }) };
+  Order.findOne = async () => order;
+  Order.findOneAndUpdate = async (_filter, update) => {
+    if (order.paymentStatus !== 'Pending Verification') return null;
+    Object.assign(order, update.$set);
+    order.paymentHistory.push(update.$push.paymentHistory);
+    return order;
   };
 
+  const receiptPaths = [];
   try {
-    const response = createResponse();
-    await initializeChapaPayment(
-      { params: { id: orderId.toString() }, user: { _id: customerId, name: 'Test Customer', email: 'customer@example.test' } },
-      response,
-      (error) => { throw error; }
-    );
-    assert.equal(response.statusCode, 200);
-    assert.equal(response.body.checkoutUrl, 'https://checkout.chapa.co/checkout/payment/test');
-    assert.equal(request.url, 'https://api.chapa.co/v1/transaction/initialize');
-    assert.equal(request.options.headers.Authorization, 'Bearer CHASECK_TEST-test-only-key');
-    const payload = JSON.parse(request.options.body);
-    assert.equal(payload.amount, '125.50');
-    assert.equal(payload.currency, 'ETB');
-    assert.equal(payload.tx_ref, order.transactionReference);
-    assert.equal(payload.callback_url, 'https://payments.example.test/api/payments/chapa/callback');
-    assert.equal(order.paymentCheckoutUrl, response.body.checkoutUrl);
+    const uploadResponse = createResponse();
+    await uploadBankTransferReceipt({
+      params: { id: orderId.toString() },
+      user: { _id: customerId },
+      body: { transactionReference: 'TX-123' },
+      file: {
+        originalname: 'payment.pdf',
+        mimetype: 'application/pdf',
+        buffer: Buffer.from('%PDF-1.4 manual payment proof'),
+      },
+    }, uploadResponse, (error) => { throw error; });
+
+    assert.equal(uploadResponse.statusCode, 200);
+    assert.equal(order.paymentStatus, 'Pending Verification');
+    assert.equal(order.isPaid, false);
+    assert.equal(order.paymentAmount, order.totalPrice);
+    assert.equal(order.transactionReference, 'TX-123');
+    const firstReceiptPath = path.join(receiptDirectory, order.paymentReceipt.storageKey);
+    receiptPaths.push(firstReceiptPath);
+    assert.equal((await fs.readFile(firstReceiptPath)).toString('ascii', 0, 4), '%PDF');
+    assert.equal(order.paymentReceiptHistory.length, 1);
+
+    order.paymentStatus = 'Rejected';
+    const correctedUploadResponse = createResponse();
+    await uploadBankTransferReceipt({
+      params: { id: orderId.toString() },
+      user: { _id: customerId },
+      body: { transactionReference: 'TX-124' },
+      file: {
+        originalname: 'corrected-payment.pdf',
+        mimetype: 'application/pdf',
+        buffer: Buffer.from('%PDF-1.4 corrected payment proof'),
+      },
+    }, correctedUploadResponse, (error) => { throw error; });
+    const correctedReceiptPath = path.join(receiptDirectory, order.paymentReceipt.storageKey);
+    receiptPaths.push(correctedReceiptPath);
+    assert.equal(correctedUploadResponse.body.paymentStatus, 'Pending Verification');
+    assert.equal(order.paymentReceiptHistory.length, 2);
+    assert.equal((await fs.readFile(firstReceiptPath)).toString('ascii', 0, 4), '%PDF');
+
+    const approvalResponse = createResponse();
+    await reviewBankTransfer({
+      params: { id: orderId.toString() },
+      user: { _id: adminId },
+      body: { decision: 'approve', note: 'Verified funds in merchant account.' },
+    }, approvalResponse, (error) => { throw error; });
+
+    assert.equal(approvalResponse.body.paymentStatus, 'Paid');
+    assert.equal(approvalResponse.body.isPaid, true);
+    assert.equal(order.paymentReviewedBy, adminId);
+    assert.equal(order.orderStatus, 'Pending');
+
+    const duplicateResponse = createResponse();
+    await reviewBankTransfer({
+      params: { id: orderId.toString() },
+      user: { _id: adminId },
+      body: { decision: 'approve', note: 'Duplicate confirmation.' },
+    }, duplicateResponse, (error) => { throw error; });
+    assert.equal(duplicateResponse.statusCode, 409);
   } finally {
     Order.findOne = originalFindOne;
-    global.fetch = originalFetch;
-    restore();
+    Order.findOneAndUpdate = originalFindOneAndUpdate;
+    await Promise.all(receiptPaths.map((receiptPath) => fs.unlink(receiptPath).catch(() => {})));
   }
 });
 
-test('Chapa checkout cannot be initialized for a cancelled order', async () => {
-  const restore = setChapaEnvironment();
-  const originalFindOne = Order.findOne;
-  const originalFetch = global.fetch;
-  Order.findOne = () => ({
-    select: async () => ({
-      orderStatus: 'Cancelled',
-      paymentStatus: 'Pending',
-      isPaid: false,
-    }),
-  });
-  global.fetch = async () => {
-    throw new Error('Chapa must not be called for a cancelled order.');
-  };
-
-  try {
-    const response = createResponse();
-    await initializeChapaPayment(
-      { params: { id: new mongoose.Types.ObjectId().toString() }, user: { _id: new mongoose.Types.ObjectId() } },
-      response,
-      (error) => { throw error; }
-    );
-    assert.equal(response.statusCode, 409);
-    assert.match(response.body.message, /cancelled order/);
-  } finally {
-    Order.findOne = originalFindOne;
-    global.fetch = originalFetch;
-    restore();
-  }
-});
-
-test('Chapa verification marks a matching payment paid exactly once', async () => {
-  const restore = setChapaEnvironment();
+test('Admin must provide a rejection reason and rejected orders retain proof eligibility', async () => {
   const originalFindOne = Order.findOne;
   const originalFindOneAndUpdate = Order.findOneAndUpdate;
-  const originalFindById = Order.findById;
-  const originalFetch = global.fetch;
   const orderId = new mongoose.Types.ObjectId();
   const order = {
     _id: orderId,
-    orderNumber: 'AS-00126',
-    paymentMethod: 'Chapa Checkout',
-    paymentStatus: 'Pending',
-    paymentAmount: 50,
-    paymentCurrency: 'ETB',
-    transactionReference: 'AS-PAY-success',
-    orderStatus: 'Processing',
-    isPaid: false,
-  };
-  let calls = 0;
-  Order.findOne = async () => order;
-  Order.findOneAndUpdate = async (_filter, update) => {
-    calls += 1;
-    Object.assign(order, update.$set);
-    return order;
-  };
-  Order.findById = async () => order;
-  global.fetch = async () => ({
-    ok: true,
-    json: async () => ({
-      status: 'success',
-      data: {
-        tx_ref: order.transactionReference,
-        status: 'success',
-        amount: '50.00',
-        currency: 'ETB',
-        reference: 'CHAPA-REF-1',
-        payment_method: 'telebirr',
-      },
-    }),
-  });
-
-  try {
-    const result = await updateChapaPaymentFromProvider(order.transactionReference);
-    assert.equal(result.order.isPaid, true);
-    assert.equal(order.paymentStatus, 'Paid');
-    assert.equal(order.paymentGatewayReference, 'CHAPA-REF-1');
-    assert.equal(order.paymentChannel, 'telebirr');
-    const duplicate = await updateChapaPaymentFromProvider(order.transactionReference);
-    assert.equal(duplicate.alreadyProcessed, true);
-    assert.equal(calls, 1);
-  } finally {
-    Order.findOne = originalFindOne;
-    Order.findOneAndUpdate = originalFindOneAndUpdate;
-    Order.findById = originalFindById;
-    global.fetch = originalFetch;
-    restore();
-  }
-});
-
-test('failed and cancelled Chapa transactions do not mark orders paid', async (t) => {
-  for (const [providerStatus, expectedStatus] of [['failed', 'Failed'], ['cancelled', 'Cancelled']]) {
-    await t.test(providerStatus, async () => {
-      const restore = setChapaEnvironment();
-      const originalFindOne = Order.findOne;
-      const originalFindOneAndUpdate = Order.findOneAndUpdate;
-      const originalFetch = global.fetch;
-      const order = {
-        _id: new mongoose.Types.ObjectId(),
-        paymentMethod: 'Chapa Checkout',
-        paymentStatus: 'Pending',
-        paymentAmount: 75,
-        paymentCurrency: 'ETB',
-        transactionReference: `AS-PAY-${providerStatus}`,
-        orderStatus: 'Pending',
-        isPaid: false,
-      };
-      Order.findOne = async () => order;
-      Order.findOneAndUpdate = async (_filter, update) => {
-        Object.assign(order, update.$set);
-        return order;
-      };
-      global.fetch = async () => ({
-        ok: true,
-        json: async () => ({
-          status: 'success',
-          data: {
-            tx_ref: order.transactionReference,
-            status: providerStatus,
-            amount: '75.00',
-            currency: 'ETB',
-          },
-        }),
-      });
-
-      try {
-        const result = await updateChapaPaymentFromProvider(order.transactionReference);
-        assert.equal(result.order.isPaid, false);
-        assert.equal(order.paymentStatus, expectedStatus);
-      } finally {
-        Order.findOne = originalFindOne;
-        Order.findOneAndUpdate = originalFindOneAndUpdate;
-        global.fetch = originalFetch;
-        restore();
-      }
-    });
-  }
-});
-
-test('a mismatched verified amount cannot mark a Chapa order paid', async () => {
-  const restore = setChapaEnvironment();
-  const originalFindOne = Order.findOne;
-  const originalFindOneAndUpdate = Order.findOneAndUpdate;
-  const originalFetch = global.fetch;
-  const order = {
-    _id: new mongoose.Types.ObjectId(),
-    paymentMethod: 'Chapa Checkout',
-    paymentStatus: 'Pending',
-    paymentAmount: 125,
-    paymentCurrency: 'ETB',
-    transactionReference: 'AS-PAY-wrong-amount',
-    isPaid: false,
-  };
-  let updates = 0;
-  Order.findOne = async () => order;
-  Order.findOneAndUpdate = async () => {
-    updates += 1;
-    return order;
-  };
-  global.fetch = async () => ({
-    ok: true,
-    json: async () => ({
-      status: 'success',
-      data: { tx_ref: order.transactionReference, status: 'success', amount: '124.00', currency: 'ETB' },
-    }),
-  });
-
-  try {
-    await assert.rejects(updateChapaPaymentFromProvider(order.transactionReference), /amount does not match/);
-    assert.equal(updates, 0);
-    assert.equal(order.isPaid, false);
-  } finally {
-    Order.findOne = originalFindOne;
-    Order.findOneAndUpdate = originalFindOneAndUpdate;
-    global.fetch = originalFetch;
-    restore();
-  }
-});
-
-test('pending Chapa verification remains pending and does not change paid state', async () => {
-  const restore = setChapaEnvironment();
-  const originalFindOne = Order.findOne;
-  const originalFindOneAndUpdate = Order.findOneAndUpdate;
-  const originalFetch = global.fetch;
-  const order = {
-    _id: new mongoose.Types.ObjectId(),
-    paymentMethod: 'Chapa Checkout',
-    paymentStatus: 'Pending',
-    paymentAmount: 18,
-    paymentCurrency: 'ETB',
-    transactionReference: 'AS-PAY-pending',
-    isPaid: false,
-  };
-  let updates = 0;
-  Order.findOne = async () => order;
-  Order.findOneAndUpdate = async () => {
-    updates += 1;
-    return order;
-  };
-  global.fetch = async () => ({
-    ok: true,
-    json: async () => ({
-      status: 'success',
-      data: { tx_ref: order.transactionReference, status: 'pending', amount: '18.00', currency: 'ETB' },
-    }),
-  });
-
-  try {
-    const result = await updateChapaPaymentFromProvider(order.transactionReference);
-    assert.equal(result.pending, true);
-    assert.equal(order.paymentStatus, 'Pending');
-    assert.equal(order.isPaid, false);
-    assert.equal(updates, 0);
-  } finally {
-    Order.findOne = originalFindOne;
-    Order.findOneAndUpdate = originalFindOneAndUpdate;
-    global.fetch = originalFetch;
-    restore();
-  }
-});
-
-test('signed Chapa webhook is verified through the API and duplicate delivery is idempotent', async () => {
-  const restore = setChapaEnvironment();
-  const originalFindOne = Order.findOne;
-  const originalFindOneAndUpdate = Order.findOneAndUpdate;
-  const originalFindById = Order.findById;
-  const originalFetch = global.fetch;
-  const order = {
-    _id: new mongoose.Types.ObjectId(),
-    orderNumber: 'AS-00128',
-    paymentMethod: 'Chapa Checkout',
-    paymentStatus: 'Pending',
-    paymentAmount: 24,
-    paymentCurrency: 'ETB',
-    transactionReference: 'AS-PAY-webhook',
-    orderStatus: 'Pending',
-    isPaid: false,
-  };
-  const event = { event: 'charge.success', tx_ref: order.transactionReference, status: 'success' };
-  const rawBody = Buffer.from(JSON.stringify(event));
-  const signature = crypto.createHmac('sha256', process.env.CHAPA_WEBHOOK_SECRET).update(rawBody).digest('hex');
-  let providerCalls = 0;
-  Order.findOne = async () => order;
-  Order.findOneAndUpdate = async (_filter, update) => {
-    Object.assign(order, update.$set);
-    return order;
-  };
-  Order.findById = async () => order;
-  global.fetch = async () => {
-    providerCalls += 1;
-    return {
-      ok: true,
-      json: async () => ({
-        status: 'success',
-        data: { tx_ref: order.transactionReference, status: 'success', amount: '24.00', currency: 'ETB' },
-      }),
-    };
-  };
-
-  try {
-    const invokeWebhook = async () => {
-      const response = createResponse();
-      await handleChapaWebhook(
-        {
-          body: rawBody,
-          get: (name) => name.toLowerCase() === 'x-chapa-signature' ? signature : undefined,
-        },
-        response
-      );
-      return response;
-    };
-    const first = await invokeWebhook();
-    const duplicate = await invokeWebhook();
-    assert.equal(first.statusCode, 200);
-    assert.equal(duplicate.statusCode, 200);
-    assert.equal(order.paymentStatus, 'Paid');
-    assert.equal(providerCalls, 1);
-  } finally {
-    Order.findOne = originalFindOne;
-    Order.findOneAndUpdate = originalFindOneAndUpdate;
-    Order.findById = originalFindById;
-    global.fetch = originalFetch;
-    restore();
-  }
-});
-
-test('bank transfer receipt upload stores a private verified file and enters pending verification', async () => {
-  const originalFindOne = Order.findOne;
-  const order = {
-    _id: new mongoose.Types.ObjectId(),
+    user: new mongoose.Types.ObjectId(),
+    paymentAccountId: 'configured-account-id',
+    paymentStatus: 'Pending Verification',
     totalPrice: 42,
-    paymentMethod: 'Bank Transfer',
-    paymentStatus: 'Pending',
-    paymentHistory: [],
-    paymentCurrency: 'ETB',
+    paymentAmount: 42,
+    paymentReceipt: { storageKey: 'receipt-key' },
     isPaid: false,
-    save: async () => order,
   };
   Order.findOne = async () => order;
-  const response = createResponse();
+  Order.findOneAndUpdate = async (_filter, update) => {
+    Object.assign(order, update.$set);
+    return order;
+  };
 
   try {
-    await uploadBankTransferReceipt(
-      {
-        params: { id: order._id.toString() },
-        user: { _id: new mongoose.Types.ObjectId() },
-        file: {
-          originalname: 'transfer.pdf',
-          mimetype: 'application/pdf',
-          buffer: Buffer.from('%PDF-1.4 test receipt'),
-        },
-      },
-      response,
-      (error) => { throw error; }
-    );
-    assert.equal(response.statusCode, 200);
-    assert.equal(order.paymentStatus, 'Pending Verification');
-    assert.equal(order.paymentAmount, 42);
-    assert.equal(response.body.paymentReceipt.originalName, 'transfer.pdf');
-    const savedPath = path.join(receiptDirectory, order.paymentReceipt.storageKey);
-    assert.equal((await fs.readFile(savedPath)).toString('ascii', 0, 4), '%PDF');
-    await fs.unlink(savedPath);
+    const missingReason = createResponse();
+    await reviewBankTransfer({
+      params: { id: orderId.toString() },
+      body: { decision: 'reject', note: '  ' },
+      user: { _id: new mongoose.Types.ObjectId() },
+    }, missingReason, (error) => { throw error; });
+    assert.equal(missingReason.statusCode, 400);
+
+    const rejection = createResponse();
+    await reviewBankTransfer({
+      params: { id: orderId.toString() },
+      body: { decision: 'reject', note: 'Amount is short.' },
+      user: { _id: new mongoose.Types.ObjectId() },
+    }, rejection, (error) => { throw error; });
+    assert.equal(rejection.statusCode, 200);
+    assert.equal(rejection.body.paymentStatus, 'Rejected');
+    assert.equal(rejection.body.paymentReviewNote, 'Amount is short.');
   } finally {
     Order.findOne = originalFindOne;
-  }
-});
-
-test('admin approval and rejection update bank transfer payment without changing order status', async (t) => {
-  for (const [decision, expectedStatus, expectedPaid] of [
-    ['approve', 'Paid', true],
-    ['reject', 'Rejected', false],
-  ]) {
-    await t.test(decision, async () => {
-      const originalFindOne = Order.findOne;
-      const originalFindOneAndUpdate = Order.findOneAndUpdate;
-      const order = {
-        _id: new mongoose.Types.ObjectId(),
-        orderNumber: 'AS-00127',
-        paymentMethod: 'Bank Transfer',
-        paymentStatus: 'Pending Verification',
-        totalPrice: 42,
-        paymentAmount: 42,
-        paymentReceipt: { storageKey: 'receipt-key' },
-        orderStatus: 'Pending',
-        isPaid: false,
-      };
-      let capturedUpdate;
-      Order.findOne = async () => order;
-      Order.findOneAndUpdate = async (_filter, update) => {
-        capturedUpdate = update;
-        Object.assign(order, update.$set);
-        return order;
-      };
-
-      try {
-        const response = createResponse();
-        await reviewBankTransfer(
-          {
-            params: { id: order._id.toString() },
-            user: { _id: new mongoose.Types.ObjectId() },
-            body: { decision, note: 'Reviewed receipt.' },
-          },
-          response,
-          (error) => { throw error; }
-        );
-        assert.equal(response.statusCode, 200);
-        assert.equal(response.body.paymentStatus, expectedStatus);
-        assert.equal(response.body.isPaid, expectedPaid);
-        assert.equal(order.orderStatus, 'Pending');
-        assert.equal(capturedUpdate.$set.paymentReviewNote, 'Reviewed receipt.');
-      } finally {
-        Order.findOne = originalFindOne;
-        Order.findOneAndUpdate = originalFindOneAndUpdate;
-      }
-    });
-
-  }
-});
-
-test('Bank Transfer, Telebirr, and CBE Birr proofs are manually verified once', async (t) => {
-  for (const paymentMethod of ['Bank Transfer', 'Telebirr', 'CBE Birr']) {
-    await t.test(paymentMethod, async () => {
-      const originalFindOne = Order.findOne;
-      const originalFindOneAndUpdate = Order.findOneAndUpdate;
-      const order = {
-        _id: new mongoose.Types.ObjectId(),
-        orderNumber: 'AS-00999',
-        paymentMethod,
-        paymentStatus: 'Awaiting Payment',
-        totalPrice: 42,
-        paymentAmount: 42,
-        paymentCurrency: 'ETB',
-        isPaid: false,
-        orderStatus: 'Pending',
-        paymentHistory: [],
-        save: async () => order,
-      };
-      Order.findOne = async (filter) => {
-        if (filter.paymentStatus?.$in && !filter.paymentStatus.$in.includes(order.paymentStatus)) return null;
-        if (filter.paymentMethod?.$in && !filter.paymentMethod.$in.includes(order.paymentMethod)) return null;
-        return order;
-      };
-      Order.findOneAndUpdate = async (_filter, update) => {
-        if (order.paymentStatus !== 'Pending Verification') return null;
-        Object.assign(order, update.$set);
-        order.paymentHistory.push(update.$push.paymentHistory);
-        return order;
-      };
-
-      try {
-        const uploadResponse = createResponse();
-        await uploadBankTransferReceipt(
-          {
-            params: { id: order._id.toString() },
-            user: { _id: new mongoose.Types.ObjectId() },
-            body: {},
-            file: {
-              originalname: 'payment.pdf',
-              mimetype: 'application/pdf',
-              buffer: Buffer.from('%PDF-1.4 manual payment proof'),
-            },
-          },
-          uploadResponse,
-          (error) => { throw error; }
-        );
-        assert.equal(uploadResponse.statusCode, 200);
-        assert.equal(order.paymentStatus, 'Pending Verification');
-        assert.equal(order.isPaid, false);
-
-        const reviewResponse = createResponse();
-        await reviewBankTransfer(
-          {
-            params: { id: order._id.toString() },
-            user: { _id: new mongoose.Types.ObjectId() },
-            body: { decision: 'approve', note: 'Checked actual merchant account.' },
-          },
-          reviewResponse,
-          (error) => { throw error; }
-        );
-        assert.equal(reviewResponse.statusCode, 200);
-        assert.equal(order.paymentStatus, 'Paid');
-        assert.equal(order.isPaid, true);
-        assert.equal(order.paymentAmount, order.totalPrice);
-
-        const duplicateResponse = createResponse();
-        await reviewBankTransfer(
-          {
-            params: { id: order._id.toString() },
-            user: { _id: new mongoose.Types.ObjectId() },
-            body: { decision: 'approve', note: 'Duplicate confirmation attempt.' },
-          },
-          duplicateResponse,
-          (error) => { throw error; }
-        );
-        assert.equal(duplicateResponse.statusCode, 409);
-      } finally {
-        Order.findOne = originalFindOne;
-        Order.findOneAndUpdate = originalFindOneAndUpdate;
-        if (order.paymentReceipt?.storageKey) {
-          await fs.unlink(path.join(receiptDirectory, order.paymentReceipt.storageKey)).catch(() => {});
-        }
-      }
-    });
+    Order.findOneAndUpdate = originalFindOneAndUpdate;
   }
 });

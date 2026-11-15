@@ -11,7 +11,6 @@ const { getJwtSecret } = require('./middleware/auth');
 const { initializeOrderNumbers } = require('./utils/orderNumbers');
 const paymentRoutes = require('./routes/paymentRoutes');
 const paymentSettingsRoutes = require('./routes/paymentSettingsRoutes');
-const { handleChapaWebhook } = require('./controllers/paymentController');
 const customerRoutes = require('./routes/customerRoutes');
 
 // Import route modules
@@ -39,12 +38,6 @@ app.use(
     },
     credentials: true,
   })
-);
-
-app.post(
-  '/api/payments/chapa/webhook',
-  express.raw({ type: 'application/json', limit: '1mb' }),
-  handleChapaWebhook
 );
 
 // Middleware: Parse JSON bodies and URL-encoded data
