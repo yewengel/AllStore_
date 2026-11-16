@@ -694,7 +694,7 @@ const updateOrderTracking = async (req, res, next) => {
 
     if (statusChanged) {
       updates.orderStatus = nextStatus;
-      if (nextStatus === 'Shipped' && !order.shippingDate && shippingDate === undefined) {
+      if (nextStatus === 'Shipped') {
         updates.shippingDate = updateTimestamp;
       }
       if (nextStatus === 'Delivered') {

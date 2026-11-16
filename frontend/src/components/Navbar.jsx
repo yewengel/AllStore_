@@ -239,16 +239,6 @@ const Navbar = () => {
                 </NavLink>
               )}
               {isCustomer && (
-                <NavLink to="/payments" className="store-nav-action store-payments-action" aria-label="Payment History">
-                  <svg viewBox="0 0 24 24" aria-hidden="true">
-                    <rect x="2" y="5" width="20" height="14" rx="2" />
-                    <path d="M2 10h20" />
-                    <path d="M6 15h4" />
-                  </svg>
-                  <span>Payments</span>
-                </NavLink>
-              )}
-              {isCustomer && (
                 <NavLink to="/wishlist" className="store-nav-action store-nav-wishlist-action" aria-label="Wishlist">
                   <span aria-hidden="true">♥</span><span>Wishlist</span>
                 </NavLink>

@@ -42,12 +42,6 @@ const LoginPage = () => {
     }
   };
 
-  const handleFillDemo = () => {
-    setEmail('customer@example.com');
-    setPassword('customer123');
-    setError(null);
-  };
-
   return (
     <div className="auth-page">
       <div className="container">
@@ -85,6 +79,9 @@ const LoginPage = () => {
                 onChange={(e) => setPassword(e.target.value)}
                 className="form-input"
               />
+              <Link to="/customer/forgot-password" className="auth-forgot-link">
+                Forgot Password?
+              </Link>
             </div>
 
             <button type="submit" disabled={loading} className="btn-primary btn-auth-submit">
@@ -92,20 +89,7 @@ const LoginPage = () => {
             </button>
           </form>
 
-          {/* Quick Demo Credentials Box */}
-          <div className="demo-credentials-box">
-            <span className="demo-title">⚡ Quick Demo Logins:</span>
-            <div className="demo-buttons-row">
-              <button type="button" onClick={handleFillDemo} className="btn-demo-fill">
-                👤 Customer Demo
-              </button>
-            </div>
-            <p className="demo-hint">
-              Clicking the button auto-populates the customer demo credentials.
-            </p>
-          </div>
-
-          <div className="auth-footer-links">
+          <div className="auth-footer-links auth-login-footer-links">
             <p>
               Don't have an account?{' '}
               <Link to="/register" className="auth-link">

@@ -1,6 +1,5 @@
 # AllStore - MERN Stack E-Commerce Platform
 > **Shop Smart. Live Better.**
-> **University Capstone Project**  
 > Full-Stack Retail Web Application built with MongoDB, Express.js, React.js, and Node.js.
 
 ---
@@ -45,6 +44,8 @@
 * **Role-Based Middleware:**
   * `protect`: Verifies the Bearer token in the `Authorization` header.
   * `admin`: Verifies `req.user.role === 'admin'`. Returns `403 Forbidden` if a customer attempts unauthorized access.
+* **Admin password reset:** The secure admin login offers a time-limited, email-delivered verification code. Only an account with the `admin` role can reset its password; codes and reset tokens are stored as keyed hashes, expire after 10 minutes, and are protected by attempt limits and resend cooldowns.
+* **Customer password reset:** Customer accounts use the same SMTP configuration and one-time verification process. The flow is restricted to accounts with the `customer` role and does not reveal whether an email is registered.
 
 ### B. Product Management (Admin)
 * Admins can create products with `name`, `description`, `price`, `category`, `subcategory`, `brand`, searchable `keywords`, `stockQuantity`, and `image`.
@@ -109,6 +110,12 @@
 | `POST` | `/api/auth/register` | Public | `{ name, email, password }` | Registers a customer, returns JWT and user profile |
 | `POST` | `/api/auth/login` | Public | `{ email, password }` | Authenticates user, returns JWT and user profile |
 | `GET` | `/api/auth/profile` | Private | Header: `Bearer <token>` | Returns logged-in user profile |
+| `POST` | `/api/auth/admin/password-reset/request` | Public, rate-limited | `{ email }` | Sends a code only to an admin; always returns a generic response |
+| `POST` | `/api/auth/admin/password-reset/verify` | Public, rate-limited | `{ email, code }` | Consumes a valid code and returns a short-lived reset token |
+| `POST` | `/api/auth/admin/password-reset/reset` | Public, rate-limited | `{ email, resetToken, newPassword }` | Changes the admin password and invalidates the reset token |
+| `POST` | `/api/auth/customer/password-reset/request` | Public, rate-limited | `{ email }` | Sends a code only to a customer; always returns a generic response |
+| `POST` | `/api/auth/customer/password-reset/verify` | Public, rate-limited | `{ email, code }` | Consumes a valid code and returns a short-lived reset token |
+| `POST` | `/api/auth/customer/password-reset/reset` | Public, rate-limited | `{ email, resetToken, newPassword }` | Changes the customer password and invalidates the reset token |
 
 ### Products (`/api/products`)
 | Method | Endpoint | Access | Body / Params | Description |
@@ -273,6 +280,14 @@ git push origin feature-auth
    * `JWT_SECRET`: `your_secure_random_jwt_secret`
    * `ETB_PER_USD`: `164.62` (keep this in sync with the frontend's `VITE_ETB_PER_USD`)
    * `CLIENT_URL`: `https://your-frontend-domain.vercel.app`
+   * `SMTP_HOST`: your email provider's SMTP hostname
+   * `SMTP_PORT`: `587` for STARTTLS, or `465` for implicit TLS
+   * `SMTP_SECURE`: `false` for port `587`; `true` for port `465`
+   * `SMTP_USER`: the SMTP username supplied by your email provider
+   * `SMTP_PASS`: the SMTP password or provider-issued app password
+   * `SMTP_FROM`: the verified sender, for example `AllStore <no-reply@your-domain.com>`
+
+   Add these SMTP variables to the **Render backend service only**. Never add `SMTP_USER`, `SMTP_PASS`, or other SMTP credentials to Vercel or `VITE_*` variables. Use values issued by your email provider; `.env.example` contains placeholders only. Email delivery must be verified with the provider's real credentials before enabling the feature in production.
 
 ### C. Frontend Deployment (Vercel)
 1. Sign in to [Vercel](https://vercel.com/) and click **Add New** &rarr; **Project**.

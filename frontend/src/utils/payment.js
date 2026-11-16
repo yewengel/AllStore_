@@ -1,4 +1,4 @@
-// Shared labels for customer payment history and order tracking.
+// Shared labels for customer order and payment details.
 
 export const paymentMethodLabel = (method) => method || 'Online Payment';
 

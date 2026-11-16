@@ -83,6 +83,10 @@ const AdminLoginPage = () => {
             required
           />
 
+          <Link className="admin-login-forgot-link" to="/secure-admin-forgot-password">
+            Forgot Password?
+          </Link>
+
           <button type="submit" className="admin-login-submit" disabled={submitting || sessionLoading}>
             {submitting ? 'Verifying access...' : 'Sign in to dashboard'}
           </button>

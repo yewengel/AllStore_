@@ -673,6 +673,63 @@ test('admin status changes appear in the customer order list with history and wi
   }
 });
 
+test('marking a paid order as shipped sets shippingDate to the status update timestamp', async () => {
+  const originalFindById = Order.findById;
+  const originalFindOneAndUpdate = Order.findOneAndUpdate;
+  const orderId = new mongoose.Types.ObjectId();
+  const userId = new mongoose.Types.ObjectId();
+  const adminId = new mongoose.Types.ObjectId();
+  const earlierDate = new Date('2026-11-15T10:00:00.000Z');
+  const order = {
+    _id: orderId,
+    user: userId,
+    orderStatus: 'Processing',
+    orderItems: [],
+    items: [],
+    trackingHistory: [],
+    totalPrice: 10,
+    isPaid: true,
+    paymentStatus: 'Paid',
+    shippingDate: earlierDate,
+    toObject() {
+      return this;
+    },
+  };
+  let capturedUpdate;
+  Order.findById = async () => order;
+  Order.findOneAndUpdate = async (_filter, update) => {
+    capturedUpdate = update;
+    Object.assign(order, update.$set);
+    if (update.$push?.trackingHistory) order.trackingHistory.push(update.$push.trackingHistory);
+    return order;
+  };
+
+  try {
+    const response = createResponse();
+    await updateOrderTracking(
+      {
+        params: { id: orderId.toString() },
+        user: { _id: adminId, role: 'admin' },
+        body: { status: 'Shipped', shippingDate: '' },
+      },
+      response,
+      (error) => { throw error; }
+    );
+
+    assert.equal(response.statusCode, 200);
+    assert.ok(capturedUpdate.$set.shippingDate instanceof Date);
+    assert.equal(
+      capturedUpdate.$set.shippingDate.getTime(),
+      capturedUpdate.$push.trackingHistory.timestamp.getTime()
+    );
+    assert.notEqual(capturedUpdate.$set.shippingDate.getTime(), earlierDate.getTime());
+    assert.equal(response.body.shippingDate.getTime(), capturedUpdate.$push.trackingHistory.timestamp.getTime());
+  } finally {
+    Order.findById = originalFindById;
+    Order.findOneAndUpdate = originalFindOneAndUpdate;
+  }
+});
+
 test('message-only admin updates append customer-visible history without exposing internal notes', async () => {
   const originalFindById = Order.findById;
   const originalFindOneAndUpdate = Order.findOneAndUpdate;

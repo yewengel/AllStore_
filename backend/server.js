@@ -24,6 +24,7 @@ const { notFound, errorHandler } = require('./middleware/error');
 
 // Initialize Express app
 const app = express();
+app.set('trust proxy', 1);
 
 // Middleware: CORS configuration
 const allowedOrigins = (process.env.CLIENT_URLS || process.env.CLIENT_URL || 'http://localhost:5173')
