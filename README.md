@@ -8,6 +8,7 @@
 
 **AllStore** is a modern, responsive, full-stack e-commerce web application engineered for small-to-medium retail businesses. The platform enables customers to browse a dynamic catalog, search and filter items, manage a shopping cart, and place orders with real-time stock deduction. It simultaneously provides a secure, role-protected administrative dashboard where store owners manage product inventory (including image uploads via Multer) and update customer order fulfillment statuses.
 
+
 ### Tech Stack
 * **Database:** MongoDB Atlas (Cloud NoSQL Database with Mongoose ODM)
 * **Backend:** Node.js & Express.js (RESTful API architecture)
@@ -32,7 +33,7 @@
 | Upload Product Images via Multer | ❌ | ✅ |
 | View All Orders from All Customers | ❌ | ✅ |
 | Update Order Status (`Pending` &rarr; `Delivered`) | ❌ | ✅ |
-| Access Admin Dashboard (`/admin`) | ❌ (Returns `403 Forbidden`) | ✅ |
+| Access Admin Login (`/secure-admin-login`) | ❌ | ✅ |
 
 ---
 
@@ -169,20 +170,68 @@
 
 The previous `/api/payments/config` and `/api/admin/payments/settings` endpoints remain available for compatibility; the active checkout and Admin settings page use `/api/payment-settings`.
 
-No email delivery integration is configured. Payment decisions and rejection reasons are recorded as customer-visible order payment updates; customers see them when their order data is fetched again.
 
+### Administrative Dashboard (`/api/admin`)
+
+| Method | Endpoint | Access | Description |
+|---|---|---|---|
+| `GET` | `/api/admin/overview` | Admin | Retrieves dashboard overview statistics |
+| `GET` | `/api/admin/customers` | Admin | Retrieves customer information |
+| `GET` | `/api/admin/orders` | Admin | Retrieves administrative order information |
+| `PATCH` | `/api/admin/orders/:id/tracking` | Admin | Updates order tracking information |
+| `GET` | `/api/admin/reviews` | Admin | Retrieves customer reviews for moderation |
+| `PATCH` | `/api/admin/reviews/:id` | Admin | Approves or rejects reviews |
+
+### Returns (`/api/returns`)
+
+| Method | Endpoint | Access | Description |
+|---|---|---|---|
+| `POST` | `/api/returns` | Authenticated | Submits a return request |
+| `GET` | `/api/returns/mine` | Authenticated | Retrieves the customer's return requests |
+| `GET` | `/api/returns/:id/photos/:photoId` | Authenticated | Retrieves an authorized return photo |
+| `GET` | `/api/returns` | Admin | Retrieves all return requests |
+| `PATCH` | `/api/returns/:id` | Admin | Updates a return request |
+
+### Administrative Payment Management (`/api/admin/payments`)
+
+All endpoints require administrator authentication.
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/admin/payments/stats` | Retrieves payment statistics |
+| `GET` | `/api/admin/payments/transactions` | Lists payment transactions |
+| `GET` | `/api/admin/payments/transactions/:id` | Retrieves transaction details |
+| `GET` | `/api/admin/payments/bank-transfers` | Lists bank-transfer payments |
+| `GET` | `/api/admin/payments/bank-transfers/:id` | Retrieves bank-transfer details |
+| `GET` | `/api/admin/payments/bank-transfers/:id/receipt` | Retrieves a payment receipt |
+| `PATCH` | `/api/admin/payments/bank-transfers/:id/review` | Approves or rejects payment proof |
+| `GET` | `/api/admin/payments/refunds` | Lists refunds |
+| `GET` | `/api/admin/payments/refunds/:id` | Retrieves refund details |
+| `POST` | `/api/admin/payments/refunds` | Creates a refund |
+| `PATCH` | `/api/admin/payments/refunds/:id/review` | Reviews a refund |
+| `POST` | `/api/admin/payments/refunds/:id/process` | Processes a refund |
+| `POST` | `/api/admin/payments/refunds/:id/complete` | Marks a refund as completed |
+| `POST` | `/api/admin/payments/refunds/:id/fail` | Records a failed refund |
+
+### Payment Account Management (`/api/payment-settings/accounts`)
+
+| Method | Endpoint | Access | Description |
+|---|---|---|---|
+| `POST` | `/api/payment-settings/accounts` | Admin | Creates a payment account |
+| `PUT` | `/api/payment-settings/accounts/:id` | Admin | Updates or changes the status of a payment account |
+| `DELETE` | `/api/payment-settings/accounts/:id` | Admin | Deletes a payment account |
 ---
 
 ## 5. Local Development Setup
 
 ### Prerequisites
-* [Node.js](https://nodejs.org/) (v18 or higher)
+** [Node.js](https://nodejs.org/) (v20.19+ or v22.12+ recommended)
 * [MongoDB](https://www.mongodb.com/) (Local instance or MongoDB Atlas free cloud cluster)
 
 ### Step 1: Clone the Repository
 ```bash
-git clone <repository-url>
-cd ecommerce-platform
+git clone https://github.com/yewengel/AllStore_.git
+cd AllStore_
 ```
 
 ### Step 2: Configure Backend Environment
@@ -334,10 +383,19 @@ git push origin feature-auth
 ![Admin Dashboard](docs/screenshots/admin-dashboard.png)
 
 ### 8. Admin Product Management
-![Admin Product Management](docs/screenshots/admin-products.png)
+![Admin Product Management](docs/screenshots/payment-setting.png)
 
 ### 9. Admin Order Management
-![Admin Order Management](docs/screenshots/admin-orders.png)
+![Admin Order Management](docs/screenshots/mongodb.png)
 
 ### 10. Payment Management
-![Payment Management](docs/screenshots/payment-management.png)
+![Payment Management](docs/screenshots/refund-management.png)
+
+## Live Deployment
+
+- **Live Storefront:** https://all-store-lemon.vercel.app/
+- **Backend API:** https://allstore-backend.onrender.com
+- **Backend Health Check:** https://allstore-backend.onrender.com/api/health
+- **GitHub Repository:** https://github.com/yewengel/AllStore_
+
+**Admin Login:** https://all-store-lemon.vercel.app/secure-admin-login
