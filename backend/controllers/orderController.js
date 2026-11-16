@@ -235,6 +235,7 @@ const createOrder = async (req, res, next) => {
     shippingAddress,
     paymentMethod,
     paymentAccountId,
+    paymentAmount,
     transactionReference,
     checkoutRequestKey,
     phoneNumber,
@@ -267,6 +268,11 @@ const createOrder = async (req, res, next) => {
     typeof paymentAccountId !== 'string' || paymentAccountId.trim().length > 100
   )) {
     return res.status(400).json({ status: 'error', message: 'Select a valid payment account.' });
+  }
+  if (paymentAmount !== undefined && (
+    typeof paymentAmount !== 'number' || !Number.isFinite(paymentAmount) || paymentAmount < 0
+  )) {
+    return res.status(400).json({ status: 'error', message: 'Payment amount must be a valid non-negative number.' });
   }
   let selectedPaymentAccount = paymentAccountId
     ? await getPaymentAccount(paymentAccountId, { activeOnly: true })
@@ -439,6 +445,9 @@ const createOrder = async (req, res, next) => {
 
       const shippingCost = subtotal >= FREE_SHIPPING_THRESHOLD_ETB ? 0 : SHIPPING_COST_ETB;
       const totalPrice = Math.round((subtotal + shippingCost + Number.EPSILON) * 100) / 100;
+      if (paymentAmount !== undefined && Math.round((paymentAmount + Number.EPSILON) * 100) / 100 !== totalPrice) {
+        throw requestError(409, 'The order total changed. Review the updated total before submitting again.');
+      }
       const orderNumber = await nextOrderNumber(session);
       const normalizedShippingAddress = {
         ...Object.fromEntries(shippingFields.map((field) => [field, shippingAddress[field].trim()])),

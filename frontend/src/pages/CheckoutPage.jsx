@@ -1,20 +1,31 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useCart } from '../context/CartContext';
 import { useAuth } from '../context/AuthContext';
 import api, { getProductImageUrl } from '../api/axios';
 import { toEtb } from '../utils/currency';
 import { useCurrency } from '../context/CurrencyContext';
+import { isUsablePaymentAccount } from '../utils/paymentAccount';
 
 const FREE_SHIPPING_THRESHOLD = toEtb(100, 'USD');
 const STANDARD_SHIPPING_COST = toEtb(9.99, 'USD');
+const RECEIPT_MAX_BYTES = 5 * 1024 * 1024;
+const RECEIPT_TYPES = new Map([
+  ['.jpg', 'image/jpeg'],
+  ['.jpeg', 'image/jpeg'],
+  ['.png', 'image/png'],
+  ['.webp', 'image/webp'],
+]);
+
+const isReceiptImage = (file) => {
+  const extension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
+  return file.size > 0 && file.size <= RECEIPT_MAX_BYTES && RECEIPT_TYPES.get(extension) === file.type;
+};
 
 const CheckoutPage = () => {
   const { cartItems, totalItems, totalPrice, clearCart } = useCart();
   const { user } = useAuth();
   const { formatPrice } = useCurrency();
-  const navigate = useNavigate();
-
   const [address, setAddress] = useState('');
   const [city, setCity] = useState('');
   const [region, setRegion] = useState('');
@@ -23,8 +34,10 @@ const CheckoutPage = () => {
   const [phoneNumber, setPhoneNumber] = useState(user?.phoneNumber || '');
   const [deliveryInstructions, setDeliveryInstructions] = useState('');
   const [paymentAccountId, setPaymentAccountId] = useState('');
-  const [transactionReference, setTransactionReference] = useState('');
-  const [receiptFile, setReceiptFile] = useState(null);
+  const [receiptSelection, setReceiptSelection] = useState(null);
+  const [showReceiptSubmission, setShowReceiptSubmission] = useState(false);
+  const [submissionSuccess, setSubmissionSuccess] = useState(null);
+  const [pendingOrder, setPendingOrder] = useState(null);
 
   const [paymentConfig, setPaymentConfig] = useState(null);
   const [configLoaded, setConfigLoaded] = useState(false);
@@ -34,30 +47,43 @@ const CheckoutPage = () => {
   const [error, setError] = useState(null);
   const submittingRef = useRef(false);
   const checkoutRequestRef = useRef({ fingerprint: '', key: '' });
+  const pendingOrderRef = useRef(null);
+  const receiptSubmissionKeyRef = useRef('');
+  const receiptPreviewUrlRef = useRef('');
+
+  const loadPaymentAccounts = useCallback(async (showLoading = true, signal) => {
+    if (showLoading) setConfigLoaded(false);
+    setConfigError('');
+    try {
+      const { data } = await api.get('/payment-settings/public', { signal });
+      const accounts = Array.isArray(data?.accounts) ? data.accounts.filter(isUsablePaymentAccount) : [];
+      setPaymentConfig({ ...data, accounts });
+      setPaymentAccountId((current) => accounts.some((account) => account.id === current) ? current : '');
+    } catch (requestError) {
+      if (signal?.aborted) return;
+      setPaymentConfig(null);
+      setPaymentAccountId('');
+      setConfigError(requestError.response?.data?.message || 'Payment accounts could not be loaded. Please retry.');
+    } finally {
+      if (!signal?.aborted) setConfigLoaded(true);
+    }
+  }, []);
 
   useEffect(() => {
-    let active = true;
-    api.get('/payment-settings/public')
-      .then(({ data }) => {
-        if (!active) return;
-        setPaymentConfig(data);
-        setConfigError('');
-        const accounts = Array.isArray(data?.accounts) ? data.accounts : [];
-        setPaymentAccountId(accounts[0]?.id || '');
-      })
-      .catch((requestError) => {
-        if (active) {
-          setPaymentConfig(null);
-          setConfigError(requestError.response?.data?.message || 'Payment options could not be loaded. Please try again later.');
-        }
-      })
-      .finally(() => { if (active) setConfigLoaded(true); });
-    return () => { active = false; };
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => { void loadPaymentAccounts(false, controller.signal); }, 0);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [loadPaymentAccounts]);
+
+  useEffect(() => () => {
+    if (receiptPreviewUrlRef.current) URL.revokeObjectURL(receiptPreviewUrlRef.current);
   }, []);
 
   const paymentAccounts = useMemo(
-    () => (Array.isArray(paymentConfig?.accounts) ? paymentConfig.accounts : [])
-      .filter((account) => account?.id && account.active),
+    () => (Array.isArray(paymentConfig?.accounts) ? paymentConfig.accounts.filter(isUsablePaymentAccount) : []),
     [paymentConfig]
   );
 
@@ -66,89 +92,159 @@ const CheckoutPage = () => {
   const grandTotal = Number((totalPrice + shippingCost - discount).toFixed(2));
 
   const selectedAccount = paymentAccounts.find((account) => account.id === paymentAccountId);
+  const receiptPaymentAccount = pendingOrder?.paymentAccountSnapshot || selectedAccount;
+  const receiptPaymentAmount = pendingOrder?.paymentAmount ?? grandTotal;
 
-  const handlePlaceOrder = async (e) => {
+  const handlePlaceOrder = (e) => {
     e.preventDefault();
     if (submittingRef.current) return;
     setError(null);
 
+    if (!selectedAccount && !pendingOrder) {
+      setError('Select an active payment account before continuing.');
+      return;
+    }
     if (!phoneNumber.trim() || !address.trim() || !city.trim() || !postalCode.trim() || !country.trim()) {
       setError('Please fill in your phone number and all required shipping address fields.');
       return;
     }
-    if (!selectedAccount) {
-      setError('There are no configured online payment methods available. Please contact the store.');
+    setShowReceiptSubmission(true);
+  };
+
+  const handleReceiptSelection = (event) => {
+    const file = event.target.files?.[0] || null;
+    if (!file) return;
+    if (!isReceiptImage(file)) {
+      setError(file.size > RECEIPT_MAX_BYTES
+        ? 'The receipt image must be no larger than 5 MB.'
+        : 'Choose a JPG, JPEG, PNG, or WebP receipt image.');
+      event.target.value = '';
       return;
     }
-    if (!receiptFile) {
-      setError('Upload your payment screenshot or receipt before submitting the order.');
+    if (receiptPreviewUrlRef.current) URL.revokeObjectURL(receiptPreviewUrlRef.current);
+    const previewUrl = URL.createObjectURL(file);
+    receiptPreviewUrlRef.current = previewUrl;
+    receiptSubmissionKeyRef.current = '';
+    setReceiptSelection({ file, previewUrl });
+    setError(null);
+  };
+
+  const handleSubmitOrderAndReceipt = async (event) => {
+    event.preventDefault();
+    if (submittingRef.current) return;
+    setError(null);
+    if (!receiptPaymentAccount) {
+      setError('Select an active payment account before continuing.');
+      return;
+    }
+    if (!receiptSelection?.file) {
+      setError('Upload a valid payment receipt before submitting your order.');
+      return;
+    }
+    if (!isReceiptImage(receiptSelection.file)) {
+      setError('Choose a JPG, JPEG, PNG, or WebP receipt image no larger than 5 MB.');
       return;
     }
 
     submittingRef.current = true;
+    setLoading(true);
     try {
-      setLoading(true);
-
-      const orderPayload = {
-        orderItems: cartItems.map((item) => ({
-          product: item.product,
-          qty: item.qty,
-        })),
-        shippingAddress: {
-          address,
-          city,
-          region,
-          postalCode,
-          country,
-        },
-        phoneNumber,
-        paymentAccountId,
-        deliveryDetails: { region, deliveryInstructions },
-        ...(transactionReference.trim() ? { transactionReference: transactionReference.trim() } : {}),
-      };
-      const fingerprint = JSON.stringify(orderPayload);
-      if (checkoutRequestRef.current.fingerprint !== fingerprint) {
-        checkoutRequestRef.current = {
-          fingerprint,
-          key: window.crypto.randomUUID(),
-        };
-      }
-      orderPayload.checkoutRequestKey = checkoutRequestRef.current.key;
-
-      const { data } = await api.post('/orders', orderPayload);
-      const receipt = new FormData();
-      receipt.append('receipt', receiptFile);
-      if (transactionReference.trim()) receipt.append('transactionReference', transactionReference.trim());
-      try {
-        await api.post(`/payments/bank-transfer/${data._id}/receipt`, receipt, {
-          headers: { 'Content-Type': 'multipart/form-data' },
-        });
-      } catch (uploadError) {
-        clearCart();
-        navigate(`/orders/${data._id}`, {
-          replace: true,
-          state: {
-            paymentActionError: uploadError.response?.data?.message
-              || 'Your order was created, but the receipt could not be uploaded. Please submit it from this page.',
+      let order = pendingOrderRef.current;
+      if (!order) {
+        const orderPayload = {
+          orderItems: cartItems.map((item) => ({
+            product: item.product,
+            qty: item.qty,
+          })),
+          shippingAddress: {
+            address,
+            city,
+            region,
+            postalCode,
+            country,
           },
-        });
-        return;
+          phoneNumber,
+          paymentAccountId,
+          paymentAmount: grandTotal,
+          deliveryDetails: { region, deliveryInstructions },
+        };
+        const fingerprint = JSON.stringify(orderPayload);
+        if (checkoutRequestRef.current.fingerprint !== fingerprint) {
+          checkoutRequestRef.current = {
+            fingerprint,
+            key: window.crypto.randomUUID(),
+          };
+        }
+        orderPayload.checkoutRequestKey = checkoutRequestRef.current.key;
+
+        const { data } = await api.post('/orders', orderPayload);
+        order = {
+          id: data._id,
+          orderNumber: data.orderNumber,
+          paymentAmount: data.paymentAmount ?? data.totalPrice ?? grandTotal,
+          paymentAccountSnapshot: data.paymentAccountSnapshot || {
+            ...selectedAccount,
+          },
+        };
+        pendingOrderRef.current = order;
+        setPendingOrder(order);
       }
+
+      const receiptPayload = new FormData();
+      receiptPayload.append('receipt', receiptSelection.file);
+      receiptPayload.append('paymentAmount', String(order.paymentAmount));
+      if (!receiptSubmissionKeyRef.current) {
+        receiptSubmissionKeyRef.current = window.crypto.randomUUID();
+      }
+      receiptPayload.append('receiptSubmissionKey', receiptSubmissionKeyRef.current);
+      await api.post(`/payments/bank-transfer/${order.id}/receipt`, receiptPayload, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
 
       clearCart();
-      navigate(`/payment/result/${data._id}`, {
-        state: { newOrderPlaced: true, orderNumber: data.orderNumber },
-      });
-    } catch (err) {
-      console.error('Failed to place order:', err);
-      setError(
-        err.response?.data?.message || 'An error occurred while placing your order. Please try again.'
-      );
+      setSubmissionSuccess({ id: order.id, orderNumber: order.orderNumber });
+      pendingOrderRef.current = null;
+      setPendingOrder(null);
+      checkoutRequestRef.current = { fingerprint: '', key: '' };
+      receiptSubmissionKeyRef.current = '';
+      if (receiptPreviewUrlRef.current) URL.revokeObjectURL(receiptPreviewUrlRef.current);
+      receiptPreviewUrlRef.current = '';
+      setReceiptSelection(null);
+      setPaymentAccountId('');
+      setShowReceiptSubmission(false);
+    } catch (requestError) {
+      const reason = requestError.response?.data?.message
+        || 'The order or receipt could not be submitted. Your details and receipt are still available to retry.';
+      setError(pendingOrderRef.current
+        ? `Order ${pendingOrderRef.current.orderNumber || ''} was created, but the receipt was not confirmed. ${reason}`
+        : reason);
     } finally {
       setLoading(false);
       submittingRef.current = false;
     }
   };
+
+  const closeReceiptSubmission = () => {
+    if (!loading) setShowReceiptSubmission(false);
+  };
+
+  if (submissionSuccess) {
+    return (
+      <div className="container checkout-success-page">
+        <section className="checkout-success-card" role="status" aria-live="polite">
+          <div className="checkout-success-icon" aria-hidden="true">✓</div>
+          <h1>Order submitted</h1>
+          <p>Your order and payment receipt have been submitted successfully. Your payment is awaiting admin verification.</p>
+          <p><strong>Order ID:</strong> {submissionSuccess.id}</p>
+          {submissionSuccess.orderNumber && <p><strong>Order number:</strong> {submissionSuccess.orderNumber}</p>}
+          <div className="checkout-success-actions">
+            <Link to={`/orders/${submissionSuccess.id}`} className="btn-secondary">View order details</Link>
+            <Link to="/my-orders" className="btn-primary">Go to My Orders</Link>
+          </div>
+        </section>
+      </div>
+    );
+  }
 
   if (cartItems.length === 0) {
     return (
@@ -164,7 +260,7 @@ const CheckoutPage = () => {
     );
   }
 
-  const placeOrderLabel = `Submit Payment Proof (${formatPrice(grandTotal, 'ETB')})`;
+  const placeOrderLabel = `Place Order (${formatPrice(grandTotal, 'ETB')})`;
 
   return (
     <div className="checkout-page">
@@ -300,7 +396,14 @@ const CheckoutPage = () => {
 
               <div className="payment-options">
                 <div className="payment-group">
-                  <h3>Pay online (ETB)</h3>
+                  <h3>Bank transfer or mobile money (ETB)</h3>
+                  {!configLoaded && <p className="payment-config-message" role="status">Loading available payment accounts…</p>}
+                  {configLoaded && configError && (
+                    <p className="payment-config-message payment-config-error" role="alert">
+                      {configError}
+                      <button type="button" className="payment-retry-button" onClick={loadPaymentAccounts}>Retry</button>
+                    </p>
+                  )}
                   {paymentAccounts.map((account) => (
                     <label
                       key={account.id}
@@ -311,15 +414,23 @@ const CheckoutPage = () => {
                         name="paymentAccountId"
                         value={account.id}
                         checked={paymentAccountId === account.id}
+                        disabled={Boolean(pendingOrder)}
                         onChange={(event) => setPaymentAccountId(event.target.value)}
                       />
                       <span className="payment-icon" aria-hidden="true">{account.type === 'bank' ? '🏦' : '📱'}</span>
-                      <div><strong>{account.name}</strong><p>{account.provider} · {account.accountHolder}</p></div>
+                      <div className="payment-account-option">
+                        <strong>{account.name}</strong>
+                        <p>{account.type === 'bank' ? 'Bank account' : 'Mobile-money account'} · {account.provider}</p>
+                        <p>Account holder: {account.accountHolder}</p>
+                        <p>Account number / payment details: {account.accountDetails}</p>
+                        {account.branch && <p>Branch: {account.branch}</p>}
+                        {account.instructions && <small>{account.instructions}</small>}
+                      </div>
                     </label>
                   ))}
-                  {configLoaded && !paymentAccounts.length && (
+                  {configLoaded && !configError && !paymentAccounts.length && (
                     <p className="payment-config-message">
-                      {configError || 'No payment accounts are available yet. The store owner must configure an active payment account.'}
+                      No active payment accounts are available. Please contact the store or try again later.
                     </p>
                   )}
                 </div>
@@ -338,33 +449,10 @@ const CheckoutPage = () => {
                 </div>
               )}
 
-              {selectedAccount && (
-                <div className="form-group" style={{ marginTop: '16px' }}>
-                  <label htmlFor="transactionReference">Payment Transaction Reference (if available)</label>
-                  <input
-                    id="transactionReference"
-                    type="text"
-                    maxLength="200"
-                    placeholder="Enter the reference from your payment app"
-                    value={transactionReference}
-                    onChange={(e) => setTransactionReference(e.target.value)}
-                    className="form-input"
-                  />
-                </div>
-              )}
-
-              {selectedAccount && (
-                <div className="form-group">
-                  <label htmlFor="receiptFile">Upload Payment Screenshot / Receipt (JPG, JPEG, PNG, or PDF) *</label>
-                  <input
-                    id="receiptFile"
-                    type="file"
-                    accept=".jpg,.jpeg,.png,.pdf,image/jpeg,image/png,application/pdf"
-                    onChange={(e) => setReceiptFile(e.target.files?.[0] || null)}
-                    className="form-input"
-                    required
-                  />
-                </div>
+              {pendingOrder && (
+                <p className="payment-config-message" role="status">
+                  Order {pendingOrder.orderNumber || pendingOrder.id} has been created. Upload its receipt here to finish checkout; retrying will continue this same order.
+                </p>
               )}
             </form>
           </div>
@@ -433,18 +521,96 @@ const CheckoutPage = () => {
               <button
                 type="submit"
                 form="checkout-form"
-                disabled={loading || !selectedAccount}
+                disabled={loading || !paymentAccounts.length}
                 className="btn-primary btn-checkout-action"
               >
-                {loading ? 'Processing…' : placeOrderLabel}
+                {loading ? 'Processing…' : pendingOrder ? 'Resume receipt submission' : placeOrderLabel}
               </button>
 
               <p className="stock-notice">
-                {'🔒 Your payment proof will be verified by an Admin before your order is processed.'}
+                {'🔒 Transfer externally. Your receipt stays pending until an administrator verifies the transaction.'}
               </p>
             </div>
           </div>
         </div>
+        {showReceiptSubmission && (
+          <div className="checkout-receipt-overlay" role="presentation">
+            <section
+              className="checkout-receipt-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="checkout-receipt-title"
+            >
+              <div className="checkout-receipt-heading">
+                <div>
+                  <p className="checkout-receipt-step">Final step</p>
+                  <h2 id="checkout-receipt-title">Upload payment receipt</h2>
+                  <p>Transfer the exact amount using your bank or mobile-money app, then attach the receipt screenshot.</p>
+                </div>
+                <button
+                  type="button"
+                  className="checkout-receipt-close"
+                  aria-label="Close receipt upload"
+                  disabled={loading}
+                  onClick={closeReceiptSubmission}
+                >
+                  ×
+                </button>
+              </div>
+
+              {receiptPaymentAccount && (
+                <div className="bank-transfer-details">
+                  <h4>{receiptPaymentAccount.name} — selected payment account</h4>
+                  <p><span>Account type</span><strong>{receiptPaymentAccount.type === 'bank' ? 'Bank' : 'Mobile money'}</strong></p>
+                  <p><span>Provider</span><strong>{receiptPaymentAccount.provider}</strong></p>
+                  <p><span>Account holder / merchant</span><strong>{receiptPaymentAccount.accountHolder}</strong></p>
+                  <p><span>Account number / payment details</span><strong>{receiptPaymentAccount.accountDetails}</strong></p>
+                  {receiptPaymentAccount.branch && <p><span>Branch</span><strong>{receiptPaymentAccount.branch}</strong></p>}
+                  {receiptPaymentAccount.instructions && <p><span>Payment instructions</span><strong>{receiptPaymentAccount.instructions}</strong></p>}
+                  <p><span>Exact amount</span><strong>{formatPrice(receiptPaymentAmount, 'ETB')}</strong></p>
+                </div>
+              )}
+
+              <form className="checkout-receipt-form" onSubmit={handleSubmitOrderAndReceipt}>
+                <label className="checkout-receipt-upload" htmlFor="checkoutReceipt">
+                  <span>{receiptSelection ? 'Replace receipt screenshot' : 'Choose receipt screenshot'}</span>
+                  <small>JPG, JPEG, PNG, or WebP · maximum 5 MB</small>
+                  <input
+                    id="checkoutReceipt"
+                    type="file"
+                    accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
+                    onChange={handleReceiptSelection}
+                    disabled={loading}
+                  />
+                </label>
+
+                {receiptSelection && (
+                  <div className="checkout-receipt-preview">
+                    <img src={receiptSelection.previewUrl} alt="Preview of uploaded payment receipt" />
+                    <div>
+                      <strong>{receiptSelection.file.name}</strong>
+                      <span>{(receiptSelection.file.size / 1024).toFixed(0)} KB</span>
+                    </div>
+                  </div>
+                )}
+
+                {error && <p className="checkout-receipt-error" role="alert">{error}</p>}
+                <div className="checkout-receipt-actions">
+                  <button type="button" className="btn-secondary" disabled={loading} onClick={closeReceiptSubmission}>
+                    Back to checkout
+                  </button>
+                  <button
+                    type="submit"
+                    className="btn-primary"
+                    disabled={loading || !receiptSelection?.file || !receiptPaymentAccount}
+                  >
+                    {loading ? 'Submitting order and receipt…' : 'Submit Order and Payment Receipt'}
+                  </button>
+                </div>
+              </form>
+            </section>
+          </div>
+        )}
       </div>
     </div>
   );

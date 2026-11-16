@@ -80,6 +80,18 @@ const OrderDetailsPage = () => {
     ['Bank Transfer', 'Telebirr', 'CBE Birr'].includes(order?.paymentMethod)) &&
     ['Awaiting Payment', 'Pending', 'Pending Verification', 'Rejected'].includes(paymentStatus) && !order?.isPaid;
 
+  const handleReceiptSelection = (event) => {
+    const file = event.target.files?.[0] || null;
+    if (file && file.size > 5 * 1024 * 1024) {
+      setReceiptFile(null);
+      setActionError('Payment receipt exceeds the 5 MB upload limit.');
+      event.target.value = '';
+      return;
+    }
+    setActionError('');
+    setReceiptFile(file);
+  };
+
   const handleReceiptUpload = async (event) => {
     event.preventDefault();
     if (!receiptFile) {
@@ -232,6 +244,9 @@ const OrderDetailsPage = () => {
                 <div><dt>Region</dt><dd>{address.region || '—'}</dd></div>
                 <div><dt>Country</dt><dd>{address.country || '—'}</dd></div>
                 <div><dt>Postal code</dt><dd>{address.postalCode || '—'}</dd></div>
+                <div><dt>Shipping date</dt><dd>{formatDate(order.shippingDate)}</dd></div>
+                <div><dt>Tracking number</dt><dd>{order.trackingNumber || '—'}</dd></div>
+                <div><dt>Delivery company</dt><dd>{order.deliveryCompany || order.courierName || '—'}</dd></div>
               </dl>
             </section>
             <OrderResolutionPanel
@@ -331,8 +346,8 @@ const OrderDetailsPage = () => {
                   )}
                   <label htmlFor="order-payment-reference">Payment transaction reference (if available)</label>
                   <input id="order-payment-reference" type="text" maxLength="200" value={transactionReference} onChange={(event) => setTransactionReference(event.target.value)} />
-                  <label htmlFor="order-payment-receipt">Upload or replace payment screenshot / receipt</label>
-                  <input id="order-payment-receipt" type="file" accept=".jpg,.jpeg,.png,.pdf,image/jpeg,image/png,application/pdf" onChange={(event) => setReceiptFile(event.target.files?.[0] || null)} />
+                  <label htmlFor="order-payment-receipt">Upload or replace payment receipt (JPG, JPEG, PNG, or WebP; max 5 MB)</label>
+                  <input id="order-payment-receipt" type="file" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" onChange={handleReceiptSelection} />
                   <button type="submit" className="btn-primary" disabled={paymentActionLoading || !receiptFile}>
                     {paymentActionLoading ? 'Submitting…' : 'Submit receipt for verification'}
                   </button>

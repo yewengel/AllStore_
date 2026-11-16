@@ -27,7 +27,9 @@ const errorHandler = (err, req, res, next) => {
     const isReceiptUpload = req.originalUrl.includes('/payments/bank-transfer/');
     message = err.code === 'LIMIT_FILE_SIZE'
       ? `${isReceiptUpload ? 'Payment receipt' : 'Image'} exceeds the 5 MB upload limit.`
-      : `Invalid ${isReceiptUpload ? 'payment receipt' : 'image'} upload.`;
+      : isReceiptUpload
+        ? 'Invalid payment receipt upload. Use a JPG, JPEG, PNG, or WebP image no larger than 5 MB.'
+        : 'Invalid image upload.';
   }
 
   if (err.type === 'entity.parse.failed') {

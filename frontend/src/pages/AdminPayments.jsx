@@ -13,6 +13,7 @@ import {
 import api from '../api/axios';
 import { useCurrency } from '../context/CurrencyContext';
 import { convertCurrency } from '../utils/currency';
+import { paymentAccountPayload } from '../utils/paymentAccount';
 import './AdminPayments.css';
 
 const PAYMENT_METHODS = ['Bank Transfer', 'Telebirr', 'CBE Birr'];
@@ -483,6 +484,14 @@ const TransactionDetailsModal = ({ id, onClose, onToast }) => {
             </div>
 
             <DetailBlock title="Order information">
+              {detail.order.paymentAccountSnapshot && (
+                <>
+                  <DetailRow label="Selected account" value={detail.order.paymentAccountSnapshot.name} />
+                  <DetailRow label="Account holder" value={detail.order.paymentAccountSnapshot.accountHolder} />
+                  <DetailRow label="Account number / mobile-money number" value={detail.order.paymentAccountSnapshot.accountDetails} />
+                  {detail.order.paymentAccountSnapshot.branch && <DetailRow label="Branch" value={detail.order.paymentAccountSnapshot.branch} />}
+                </>
+              )}
               <div className="pay-order-items">
                 {detail.order.items.map((item, index) => (
                   <div className="pay-order-item" key={`${item.name}-${index}`}>
@@ -595,6 +604,7 @@ const DetailRow = ({ label, value }) => (
 const BankTransfersPage = ({ onToast, onView }) => {
   const { money } = useAdminMoney();
   const [status, setStatus] = useState('awaiting');
+  const [search, setSearch] = useState('');
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState(null);
@@ -616,6 +626,20 @@ const BankTransfersPage = ({ onToast, onView }) => {
     const timer = window.setTimeout(load, 0);
     return () => window.clearTimeout(timer);
   }, [load]);
+
+  const visibleRows = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    if (!query) return rows;
+    return rows.filter((row) => [
+      row.orderNumber,
+      row.id,
+      row.customerName,
+      row.customerEmail,
+      row.paymentMethod,
+      row.paymentAccountSnapshot?.provider,
+      row.paymentAccountSnapshot?.accountDetails,
+    ].some((value) => String(value || '').toLowerCase().includes(query)));
+  }, [rows, search]);
 
   const review = async (row, decision, note) => {
     setBusyId(row.id);
@@ -652,20 +676,31 @@ const BankTransfersPage = ({ onToast, onView }) => {
           <h2>Payment verification</h2>
           <p>Verify each payment against the corresponding bank or merchant account before marking it paid</p>
         </div>
+        <input
+          className="pay-input pay-search-input"
+          type="search"
+          aria-label="Search payments by order or customer"
+          placeholder="Search order ID, customer, or email"
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+        />
         <select className="admin-filter-select" value={status} onChange={(event) => setStatus(event.target.value)}>
           <option value="awaiting">Pending verification</option>
-          <option value="reviewed">Verified</option>
+          <option value="reviewed">Paid</option>
           <option value="rejected">Rejected</option>
         </select>
       </div>
 
       {loading ? (
         <Loader label="Loading bank transfers…" />
-      ) : !rows.length ? (
-        <EmptyState title="No payments awaiting verification" detail="Submitted payment proofs will appear here." />
+      ) : !visibleRows.length ? (
+        <EmptyState
+          title={rows.length ? 'No matching payments' : `No ${status === 'reviewed' ? 'paid' : status === 'rejected' ? 'rejected' : 'pending verification'} payments`}
+          detail={rows.length ? 'Try another order number or customer search.' : 'Submitted payment proofs will appear here.'}
+        />
       ) : (
         <div className="pay-card-list">
-          {rows.map((row) => (
+          {visibleRows.map((row) => (
             <article className="pay-transfer-card" key={row.id}>
               <div className="pay-transfer-main">
                 <div className="pay-transfer-head">
@@ -674,7 +709,10 @@ const BankTransfersPage = ({ onToast, onView }) => {
                 </div>
                 <div className="pay-transfer-grid">
                   <DetailRow label="Customer" value={row.customerName} />
+                  <DetailRow label="Email" value={row.customerEmail || '—'} />
                   <DetailRow label="Payment method" value={row.paymentMethod} />
+                  <DetailRow label="Selected account" value={row.paymentAccountSnapshot?.name || row.paymentMethod} />
+                  <DetailRow label="Account number" value={row.paymentAccountSnapshot?.accountDetails || '—'} />
                   <DetailRow label="Expected amount" value={money(row.amount)} />
                   <DetailRow label="Transaction reference" value={row.transactionReference || '—'} />
                   <DetailRow label="Submitted" value={formatDateTime(row.receipt?.uploadedAt || row.createdAt)} />
@@ -1263,8 +1301,8 @@ const PaymentSettingsPage = ({ onToast }) => {
     setSaving(true);
     try {
       const { data } = editingId
-        ? await api.put(`/payment-settings/accounts/${editingId}`, form)
-        : await api.post('/payment-settings/accounts', form);
+        ? await api.put(`/payment-settings/accounts/${editingId}`, paymentAccountPayload(form))
+        : await api.post('/payment-settings/accounts', paymentAccountPayload(form));
       apply(data);
       resetForm();
       onToast?.(editingId ? 'Payment account updated.' : 'Payment account added.');
@@ -1277,11 +1315,9 @@ const PaymentSettingsPage = ({ onToast }) => {
 
   const toggleAccount = async (account) => {
     setSaving(true);
-    const { id, ...accountFields } = account;
     try {
-      const { data } = await api.put(`/payment-settings/accounts/${id}`, {
-        ...accountFields,
-        active: !account.active,
+      const { data } = await api.put(`/payment-settings/accounts/${account.id}`, {
+        ...paymentAccountPayload({ ...account, active: !account.active }),
       });
       apply(data);
       onToast?.(account.active ? 'Payment account deactivated.' : 'Payment account activated.');
@@ -1353,9 +1389,8 @@ const PaymentSettingsPage = ({ onToast }) => {
                     className="admin-outline-button"
                     disabled={saving}
                     onClick={() => {
-                      const { id, ...accountFields } = account;
-                      setEditingId(id);
-                      setForm(accountFields);
+                      setEditingId(account.id);
+                      setForm(paymentAccountPayload(account));
                     }}
                   >
                     Edit

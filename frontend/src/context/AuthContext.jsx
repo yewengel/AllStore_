@@ -1,6 +1,7 @@
 /* eslint-disable react-refresh/only-export-components */
 import { createContext, useContext, useState, useEffect } from 'react';
 import api from '../api/axios';
+import { clearAuthSession, persistAuthSession } from '../api/authToken';
 
 const AuthContext = createContext();
 
@@ -22,11 +23,10 @@ export const AuthProvider = ({ children }) => {
           // Verify with backend profile endpoint
           const { data } = await api.get('/auth/profile');
           setUser(data);
-          localStorage.setItem('user', JSON.stringify(data));
+          persistAuthSession({ ...data, token: storedToken });
         } catch {
           // Token expired or invalid
-          localStorage.removeItem('token');
-          localStorage.removeItem('user');
+          clearAuthSession();
           setUser(null);
           setToken(null);
         }
@@ -35,18 +35,35 @@ export const AuthProvider = ({ children }) => {
     };
 
     restoreSession();
+    const syncSession = () => {
+      const storedToken = localStorage.getItem('token');
+      const storedUser = localStorage.getItem('user');
+      if (!storedToken || !storedUser) {
+        setUser(null);
+        setToken(null);
+        return;
+      }
+      try {
+        const user = JSON.parse(storedUser);
+        setUser(user);
+        setToken(storedToken);
+        if (user.role !== 'admin') localStorage.removeItem('adminToken');
+      } catch {
+        clearAuthSession();
+        setUser(null);
+        setToken(null);
+      }
+    };
+    window.addEventListener('storage', syncSession);
+    return () => window.removeEventListener('storage', syncSession);
   }, []);
 
   // Login handler
   const login = async (email, password) => {
     const { data } = await api.post('/auth/login', { email, password });
-    localStorage.setItem('token', data.token);
-    localStorage.setItem(
-      'user',
-      JSON.stringify({ _id: data._id, name: data.name, email: data.email, role: data.role })
-    );
+    const user = persistAuthSession(data);
     setToken(data.token);
-    setUser({ _id: data._id, name: data.name, email: data.email, role: data.role });
+    setUser(user);
     return data;
   };
 
@@ -58,9 +75,7 @@ export const AuthProvider = ({ children }) => {
       throw error;
     }
 
-    const adminUser = { _id: data._id, name: data.name, email: data.email, role: data.role };
-    localStorage.setItem('token', data.token);
-    localStorage.setItem('user', JSON.stringify(adminUser));
+    const adminUser = persistAuthSession(data);
     setToken(data.token);
     setUser(adminUser);
     return data;
@@ -69,20 +84,15 @@ export const AuthProvider = ({ children }) => {
   // Register handler
   const register = async (name, email, password) => {
     const { data } = await api.post('/auth/register', { name, email, password });
-    localStorage.setItem('token', data.token);
-    localStorage.setItem(
-      'user',
-      JSON.stringify({ _id: data._id, name: data.name, email: data.email, role: data.role })
-    );
+    const user = persistAuthSession(data);
     setToken(data.token);
-    setUser({ _id: data._id, name: data.name, email: data.email, role: data.role });
+    setUser(user);
     return data;
   };
 
   // Logout handler
   const logout = () => {
-    localStorage.removeItem('token');
-    localStorage.removeItem('user');
+    clearAuthSession();
     setUser(null);
     setToken(null);
   };

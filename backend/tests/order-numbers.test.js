@@ -9,6 +9,7 @@ const Product = require('../models/Product');
 const PaymentSetting = require('../models/PaymentSetting');
 const { createOrder } = require('../controllers/orderController');
 const { initializeOrderNumbers, nextOrderNumber } = require('../utils/orderNumbers');
+const { toEtb } = require('../utils/currency');
 
 const configureBankPaymentForTest = () => {
   const originalReadyState = mongoose.connection.readyState;
@@ -368,6 +369,7 @@ test('checkout prices and reserves the selected variant from MongoDB data', asyn
             postalCode: '12345',
             country: 'Test Country',
           },
+          paymentAmount: 2600 + toEtb(9.99, 'USD'),
         },
       },
       response,
@@ -379,6 +381,7 @@ test('checkout prices and reserves the selected variant from MongoDB data', asyn
     assert.equal(savedOrder.orderItems[0].variantId.toString(), variantId.toString());
     assert.equal(savedOrder.orderItems[0].options.get('Color'), 'Navy');
     assert.equal(savedOrder.orderItems[0].variantSku, 'BAG-N-S');
+    assert.equal(savedOrder.paymentAmount, 2600 + toEtb(9.99, 'USD'));
     assert.equal(response.body.orderItems[0].options.Size, 'Small');
     assert.deepEqual(stockUpdate.update, {
       $inc: { 'variants.$.stockQuantity': -2, stockQuantity: -2 },

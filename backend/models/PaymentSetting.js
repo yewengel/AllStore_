@@ -31,6 +31,10 @@ const paymentSettingSchema = new mongoose.Schema(
       type: [String],
       default: [],
     },
+    deletedPaymentAccounts: {
+      type: [String],
+      default: [],
+    },
     accounts: {
       type: [paymentAccountSchema],
       default: [],

@@ -181,8 +181,8 @@ const MyOrders = () => {
           <div className="alert-order-placed" role="status">
             <div className="alert-order-icon">✓</div>
             <div className="alert-order-text">
-              <h3>Payment proof submitted</h3>
-              <p>Your order has been submitted. Your payment proof is awaiting Admin verification. You will receive an update once your payment is confirmed.</p>
+              <h3>Order placed — payment is still due</h3>
+              <p>Transfer the exact amount using your selected bank or mobile-money account, then submit the receipt from Order Details. AllStore has not received or verified a payment.</p>
               {justPlacedOrderNumber && <p>Your Order ID is <strong>{justPlacedOrderNumber}</strong>.</p>}
             </div>
           </div>
@@ -308,6 +308,17 @@ const MyOrders = () => {
                       )}
                       {paymentUpdate?.message && order.paymentStatus !== 'Rejected' && (
                         <span className="payment-receipt-status">{paymentUpdate.message}</span>
+                      )}
+                      <span className="payment-receipt-status">
+                        {order.paymentReceipt?.uploadedAt
+                          ? `Receipt submitted ${orderDate(order.paymentReceipt.uploadedAt)}`
+                          : 'Receipt not submitted'}
+                      </span>
+                      {order.shippingDate && (
+                        <span className="payment-receipt-status">Shipping date: {orderDate(order.shippingDate)}</span>
+                      )}
+                      {order.trackingNumber && (
+                        <span className="payment-receipt-status">Tracking number: {order.trackingNumber}</span>
                       )}
                       <strong>Total <b>{formatPrice(order.totalPrice, order.currency)}</b></strong>
                     </div>

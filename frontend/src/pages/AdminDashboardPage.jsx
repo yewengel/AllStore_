@@ -1125,9 +1125,19 @@ const AdminDashboardPage = () => {
               <p><strong>Customer:</strong> {orderDetails.user?.name || orderDetails.customerName || 'Customer'}</p>
               <p><strong>Amount expected:</strong> {formatPrice(orderDetails.totalPrice, orderDetails.currency)}</p>
               <p><strong>Payment method:</strong> {orderDetails.paymentMethod || '—'}</p>
+              {orderDetails.paymentAccountSnapshot && (
+                <>
+                  <p><strong>Payment provider:</strong> {orderDetails.paymentAccountSnapshot.provider}</p>
+                  <p><strong>Account used:</strong> {orderDetails.paymentAccountSnapshot.accountHolder} · {orderDetails.paymentAccountSnapshot.accountDetails}</p>
+                  {orderDetails.paymentAccountSnapshot.branch && <p><strong>Branch:</strong> {orderDetails.paymentAccountSnapshot.branch}</p>}
+                </>
+              )}
               <p><strong>Transaction reference:</strong> {orderDetails.transactionReference || '—'}</p>
               <p><strong>Payment submission date:</strong> {formatDateTime(orderDetails.paymentReceipt?.uploadedAt)}</p>
               <p><strong>Verification status:</strong> {orderDetails.isPaid ? 'Paid' : orderDetails.paymentStatus || 'Awaiting Payment'}</p>
+              {!orderDetails.isPaid && orderDetails.paymentStatus !== 'Paid' && (
+                <p>Payment must be verified and marked as Paid before this order can be processed or shipped.</p>
+              )}
               {orderDetails.paymentReviewNote && <p><strong>Review note:</strong> {orderDetails.paymentReviewNote}</p>}
               {orderDetails.paymentReviewedAt && <p><strong>Verified date:</strong> {formatDateTime(orderDetails.paymentReviewedAt)}</p>}
               {orderDetails.paymentReceipt && (
@@ -1146,7 +1156,7 @@ const AdminDashboardPage = () => {
             <div className="order-detail-items">{(orderDetails.orderItems || []).map((item, index) => <div className="order-detail-item" key={`${item.product}-${index}`}><img src={getProductImageUrl(item.image)} alt="" /><span><strong>{item.name}</strong>{Object.entries(item.options || {}).map(([name, value]) => <small key={name}>{name}: {value}</small>)}<small>{item.qty} × {formatPrice(item.price, item.currency || orderDetails.currency)}</small></span><strong>{formatPrice(item.qty * item.price, item.currency || orderDetails.currency)}</strong></div>)}</div>
 
             <div className="admin-tracking-form">
-              <label className="admin-status-control">Order status<select value={orderDetails.orderStatus || 'Pending'} onChange={(event) => updateOrderDetailField('orderStatus', event.target.value)}>{ORDER_STATUS_OPTIONS.map((status) => <option key={status}>{status}</option>)}</select></label>
+              <label className="admin-status-control">Order status<select value={orderDetails.orderStatus || 'Pending'} onChange={(event) => updateOrderDetailField('orderStatus', event.target.value)}>{ORDER_STATUS_OPTIONS.map((status) => <option key={status} disabled={!isPaidOrder(orderDetails) && status !== orderDetails.orderStatus && ['Processing', 'Shipped', 'Out for Delivery', 'Delivered'].includes(status)}>{status}</option>)}</select></label>
               <label className="admin-status-control">Tracking number<input type="text" value={orderDetails.trackingNumber || ''} onChange={(event) => updateOrderDetailField('trackingNumber', event.target.value)} placeholder="e.g. AS123456789" /></label>
               <label className="admin-status-control">Courier name<input type="text" value={orderDetails.courierName || ''} onChange={(event) => updateOrderDetailField('courierName', event.target.value)} placeholder="e.g. DHL, FedEx, Aramex" /></label>
               <label className="admin-status-control">Estimated delivery<input type="date" value={orderDetails.estimatedDelivery ? new Date(orderDetails.estimatedDelivery).toISOString().split('T')[0] : ''} onChange={(event) => updateOrderDetailField('estimatedDelivery', event.target.value)} /></label>

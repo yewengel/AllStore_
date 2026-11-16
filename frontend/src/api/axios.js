@@ -1,7 +1,9 @@
 import axios from 'axios';
+import { getRequestToken } from './authToken';
+import { getApiBaseUrl } from './apiBaseUrl';
 
-// Base API URL: uses environment variable or defaults to backend port 5000
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
+const API_BASE_URL = getApiBaseUrl(import.meta.env.VITE_API_URL, import.meta.env.PROD);
+const BACKEND_BASE_URL = API_BASE_URL.replace(/\/api\/?$/, '');
 
 const api = axios.create({
   baseURL: API_BASE_URL,
@@ -13,7 +15,7 @@ const api = axios.create({
 // Request interceptor to attach JWT token to headers if present
 api.interceptors.request.use(
   (config) => {
-    const token = localStorage.getItem('token');
+    const token = getRequestToken(config.url);
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
     }
@@ -42,8 +44,7 @@ export const getProductImageUrl = (imagePath) => {
   if (imagePath.startsWith('http://') || imagePath.startsWith('https://')) {
     return imagePath;
   }
-  const backendUrl = (import.meta.env.VITE_API_URL || 'http://localhost:5000').replace(/\/api\/?$/, '');
-  return `${backendUrl}${imagePath.startsWith('/') ? '' : '/'}${imagePath}`;
+  return `${BACKEND_BASE_URL}${imagePath.startsWith('/') ? '' : '/'}${imagePath}`;
 };
 
 export default api;

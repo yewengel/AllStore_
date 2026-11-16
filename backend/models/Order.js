@@ -92,6 +92,7 @@ const paymentReceiptSchema = new mongoose.Schema(
     mimeType: { type: String, trim: true },
     originalName: { type: String, trim: true },
     uploadedAt: { type: Date },
+    submissionKey: { type: String, trim: true },
   },
   { _id: false }
 );

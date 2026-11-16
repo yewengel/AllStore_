@@ -59,7 +59,9 @@ const serializePaymentAccount = (account, fallbackId) => ({
 
 const legacyPaymentAccounts = (settings) => {
   const disabled = new Set(settings?.disabledMethods || []);
+  const deleted = new Set(settings?.deletedPaymentAccounts || []);
   return LEGACY_METHODS.flatMap((method) => {
+    if (deleted.has(method.id)) return [];
     const account = {
       id: method.id,
       name: method.name,
@@ -72,12 +74,11 @@ const legacyPaymentAccounts = (settings) => {
       active: false,
     };
     const hasLegacyData = [
-      account.provider,
       account.accountHolder,
       account.accountDetails,
       account.branch,
       account.instructions,
-    ].some(Boolean);
+    ].some(Boolean) || (method.type === 'bank' && account.provider);
     if (!hasLegacyData) return [];
     account.active = !disabled.has(method.disabledKey) && isPaymentAccountComplete(account);
     return [account];
@@ -86,11 +87,11 @@ const legacyPaymentAccounts = (settings) => {
 
 const paymentAccountsFromSettings = (settings) => {
   if (!settings) return [];
-  const storedAccounts = settings.accounts || [];
-  if (settings.accountsMigrated || storedAccounts.length > 0) {
-    return storedAccounts.map((account) => serializePaymentAccount(account));
-  }
-  return legacyPaymentAccounts(settings);
+  const storedAccounts = (settings.accounts || []).map((account) => serializePaymentAccount(account));
+  const storedIds = new Set(storedAccounts.map((account) => account.id));
+  const remainingLegacyAccounts = legacyPaymentAccounts(settings)
+    .filter((account) => !storedIds.has(account.id));
+  return [...storedAccounts, ...remainingLegacyAccounts];
 };
 
 const getPaymentSettings = async () => {
@@ -119,6 +120,7 @@ const getPublicPaymentAccounts = async () => (
       accountDetails,
       branch,
       instructions,
+      active: true,
     }))
 );
 
@@ -133,6 +135,7 @@ const paymentAccountSnapshot = (account) => ({
 });
 
 const legacyPaymentAccountDocuments = (settings) => legacyPaymentAccounts(settings)
+  .filter(isPaymentAccountComplete)
   .map(({ id, ...account }) => ({ _id: id, ...account }));
 
 module.exports = {
@@ -140,7 +143,9 @@ module.exports = {
   getPaymentAccount,
   getPaymentSettings,
   isPaymentAccountComplete,
+  isLegacyPaymentAccountId: (id) => LEGACY_METHODS.some((method) => method.id === String(id)),
   legacyPaymentAccountDocuments,
+  legacyPaymentAccounts,
   paymentAccountSnapshot,
   paymentAccountsFromSettings,
   serializePaymentAccount,

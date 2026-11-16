@@ -11,5 +11,8 @@ npm install
 npm run dev
 ```
 
-Set `VITE_API_URL` to the backend API URL when it is not `http://localhost:5000/api`.
+The development API defaults to `http://localhost:5000/api`. Production builds default
+to `https://allstore-backend.onrender.com/api`; set `VITE_API_URL` in Vercel to override
+the default when using a different backend. The Render backend must allow the deployed
+Vercel origin through its `CLIENT_URL` or `CLIENT_URLS` setting.
 The AllStore logo is served from `public/images/allstore-logo.png`.

@@ -19,13 +19,18 @@ const OUTCOMES = {
     message: 'Your payment was verified by our team. Thank you for your purchase.',
   },
   pending: {
+    icon: '→',
+    title: 'Awaiting Payment',
+    message: 'Your order is reserved. Transfer the exact amount to the account below using your bank or mobile-money app. Then submit your receipt from Order Details. No transfer has been made or verified by AllStore.',
+  },
+  verification: {
     icon: '⏳',
-    title: 'Payment Proof Submitted',
-    message: 'Your order has been submitted. Your payment proof is awaiting Admin verification. You will receive an update once your payment is confirmed.',
+    title: 'Pending Verification',
+    message: 'Your receipt has been submitted. An administrator will verify the transfer in the receiving account before marking it paid.',
   },
   failed: {
     icon: '✕',
-    title: 'Payment Failed',
+    title: 'Payment Rejected',
     message: 'Your payment proof was rejected. Review the reason and upload corrected proof from your order.',
   },
   cancelled: {
@@ -61,6 +66,7 @@ const PaymentResult = () => {
     if (order.isPaid || order.paymentStatus === 'Paid') return 'success';
     if (order.orderStatus === 'Cancelled' || order.paymentStatus === 'Cancelled') return 'cancelled';
     if (order.paymentStatus === 'Failed' || order.paymentStatus === 'Rejected') return 'failed';
+    if (order.paymentStatus === 'Pending Verification') return 'verification';
     return 'pending';
   }, [order]);
 
@@ -91,7 +97,7 @@ const PaymentResult = () => {
 
   const outcomeMessage = (() => {
     if (order.paymentStatus === 'Rejected') {
-      return `Your payment was rejected: ${order.paymentReviewNote || 'Please upload corrected payment proof.'}`;
+      return `Your payment was rejected: ${order.paymentReviewNote || 'Please upload corrected payment proof from Order Details.'}`;
     }
     if (outcome !== 'pending') return details.message;
     return details.message;
@@ -125,8 +131,22 @@ const PaymentResult = () => {
             )}
           </div>
 
+          {order.paymentAccountSnapshot && outcome !== 'success' && (
+            <div className="bank-transfer-details">
+              <h4>{order.paymentAccountSnapshot.name} transfer details</h4>
+              <p><span>Provider</span><strong>{order.paymentAccountSnapshot.provider}</strong></p>
+              <p><span>Account holder</span><strong>{order.paymentAccountSnapshot.accountHolder}</strong></p>
+              <p><span>Account number / mobile-money number</span><strong>{order.paymentAccountSnapshot.accountDetails}</strong></p>
+              {order.paymentAccountSnapshot.branch && <p><span>Branch</span><strong>{order.paymentAccountSnapshot.branch}</strong></p>}
+              {order.paymentAccountSnapshot.instructions && <p><span>Instructions</span><strong>{order.paymentAccountSnapshot.instructions}</strong></p>}
+              <p><span>Exact amount to transfer</span><strong>{formatPrice(order.paymentAmount ?? order.totalPrice, order.paymentCurrency || order.currency || 'ETB')}</strong></p>
+            </div>
+          )}
+
           <div className="payment-result-actions">
-            <Link to={`/orders/${order._id}`} className="btn-primary">View Order</Link>
+            <Link to={`/orders/${order._id}`} className="btn-primary">
+              {order.paymentStatus === 'Pending Verification' ? 'View Order' : 'View Order & Submit Receipt'}
+            </Link>
             <Link to={`/orders/track/${order._id}`} className="btn-secondary">Track Order</Link>
             <Link to="/products" className="btn-secondary">Continue Shopping</Link>
           </div>

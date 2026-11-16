@@ -93,13 +93,28 @@ const uploadBankTransferReceipt = async (req, res, next) => {
   let storedPath;
   try {
     if (!req.file || !hasValidReceiptSignature(req.file)) {
-      return res.status(400).json({ status: 'error', message: 'Upload a valid JPG, JPEG, PNG, or PDF payment receipt.' });
+      return res.status(400).json({ status: 'error', message: 'Upload a valid JPG, JPEG, PNG, or WebP payment receipt.' });
     }
     const { transactionReference } = req.body || {};
     if (transactionReference !== undefined && (
       typeof transactionReference !== 'string' || transactionReference.trim().length > 200
     )) {
       return res.status(400).json({ status: 'error', message: 'Payment transaction reference must be no longer than 200 characters.' });
+    }
+    const { paymentAmount, receiptSubmissionKey } = req.body || {};
+    if (paymentAmount !== undefined && (
+      typeof paymentAmount !== 'string' ||
+      !paymentAmount.trim() ||
+      !Number.isFinite(Number(paymentAmount)) ||
+      Number(paymentAmount) < 0
+    )) {
+      return res.status(400).json({ status: 'error', message: 'Payment amount must be a valid non-negative number.' });
+    }
+    if (receiptSubmissionKey !== undefined && (
+      typeof receiptSubmissionKey !== 'string' ||
+      !/^[A-Za-z0-9._:-]{8,128}$/.test(receiptSubmissionKey.trim())
+    )) {
+      return res.status(400).json({ status: 'error', message: 'A valid receipt submission key is required.' });
     }
     const order = await Order.findOne({
       _id: req.params.id,
@@ -110,6 +125,35 @@ const uploadBankTransferReceipt = async (req, res, next) => {
       isPaid: { $ne: true },
     });
     if (!order) return res.status(404).json({ status: 'error', message: 'An eligible manual payment order was not found.' });
+
+    const expectedAmount = Number(order.paymentAmount ?? order.totalPrice);
+    if (paymentAmount !== undefined && Number(paymentAmount) !== expectedAmount) {
+      return res.status(409).json({ status: 'error', message: 'The submitted payment amount does not match the order total.' });
+    }
+    if (receiptSubmissionKey && (
+      order.paymentReceipt?.submissionKey === receiptSubmissionKey ||
+      (order.paymentReceiptHistory || []).some((receipt) => receipt.submissionKey === receiptSubmissionKey)
+    )) {
+      return res.json({
+        orderId: order._id,
+        orderNumber: order.orderNumber,
+        paymentMethod: order.paymentMethod,
+        paymentStatus: order.paymentStatus,
+        paymentAmount: order.paymentAmount,
+        paymentCurrency: order.paymentCurrency,
+        transactionReference: order.transactionReference || '',
+        paymentReceipt: order.paymentReceipt ? {
+          mimeType: order.paymentReceipt.mimeType,
+          originalName: order.paymentReceipt.originalName,
+          uploadedAt: order.paymentReceipt.uploadedAt,
+        } : null,
+        paymentReceiptHistory: (order.paymentReceiptHistory || []).map((receipt) => ({
+          mimeType: receipt.mimeType,
+          originalName: receipt.originalName,
+          uploadedAt: receipt.uploadedAt,
+        })),
+      });
+    }
 
     const storageKey = crypto.randomUUID();
     await fs.mkdir(receiptDirectory, { recursive: true });
@@ -122,6 +166,7 @@ const uploadBankTransferReceipt = async (req, res, next) => {
       mimeType: req.file.mimetype,
       originalName: path.basename(req.file.originalname).slice(0, 120),
       uploadedAt: new Date(),
+      ...(receiptSubmissionKey ? { submissionKey: receiptSubmissionKey.trim() } : {}),
     };
     order.paymentReceiptHistory = order.paymentReceiptHistory || [];
     if (order.paymentReceipt?.storageKey && !order.paymentReceiptHistory.some(

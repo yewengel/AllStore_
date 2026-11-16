@@ -12,6 +12,8 @@ const { paymentHistoryEntry } = require('./paymentController');
 const {
   getPaymentSettings,
   isPaymentAccountComplete,
+  isLegacyPaymentAccountId,
+  legacyPaymentAccounts,
   legacyPaymentAccountDocuments,
   paymentAccountsFromSettings,
 } = require('../utils/paymentSettings');
@@ -97,7 +99,14 @@ const serializeTransaction = (order) => ({
   paymentMethod: order.paymentMethod,
   paymentChannel: order.paymentChannel || '',
   methodLabel: normalizeMethod(order),
-  paymentProvider: providerLabel(order),
+  paymentProvider: order.paymentAccountSnapshot?.provider || providerLabel(order),
+  paymentAccountSnapshot: order.paymentAccountSnapshot ? {
+    name: order.paymentAccountSnapshot.name || '',
+    provider: order.paymentAccountSnapshot.provider || '',
+    accountHolder: order.paymentAccountSnapshot.accountHolder || '',
+    accountDetails: order.paymentAccountSnapshot.accountDetails || '',
+    branch: order.paymentAccountSnapshot.branch || '',
+  } : null,
   amount: orderAmountEtb(order),
   currency: 'ETB',
   paymentDate: order.paymentDate || order.paidAt || null,
@@ -365,6 +374,7 @@ const getTransactionDetail = async (req, res, next) => {
         discountAmount: round2(discount),
         totalPrice: round2(Number(order.totalPrice) || 0),
         currency: order.currency || 'ETB',
+        paymentAccountSnapshot: order.paymentAccountSnapshot || null,
         deliveryAddress: order.deliveryAddress || [
           order.shippingAddress?.address,
           order.shippingAddress?.city,
@@ -1061,8 +1071,9 @@ const getEditablePaymentSettings = async () => {
   if (!settings) {
     settings = new PaymentSetting({ key: 'payment', accountsMigrated: true });
   } else if (!settings.accountsMigrated) {
-    if (!settings.accounts?.length) {
-      settings.accounts = legacyPaymentAccountDocuments(settings);
+    const storedIds = new Set((settings.accounts || []).map((account) => String(account._id)));
+    for (const account of legacyPaymentAccountDocuments(settings)) {
+      if (!storedIds.has(String(account._id))) settings.accounts.push(account);
     }
     settings.accountsMigrated = true;
   }
@@ -1094,11 +1105,20 @@ const updatePaymentAccount = async (req, res, next) => {
   try {
     const settings = await getEditablePaymentSettings();
     const account = settings.accounts.id(req.params.id);
-    if (!account) return res.status(404).json({ status: 'error', message: 'Payment account not found.' });
+    const legacyAccount = account
+      ? null
+      : legacyPaymentAccounts(settings).find((candidate) => candidate.id === req.params.id);
+    if (!account && !legacyAccount) {
+      return res.status(404).json({ status: 'error', message: 'Payment account not found.' });
+    }
 
-    const result = normalizePaymentAccount(req.body, account.toObject());
+    const result = normalizePaymentAccount(req.body, account?.toObject() || legacyAccount);
     if (result.error) return res.status(400).json({ status: 'error', message: result.error });
-    Object.assign(account, result.account);
+    if (account) {
+      Object.assign(account, result.account);
+    } else {
+      settings.accounts.push({ _id: legacyAccount.id, ...result.account });
+    }
     settings.updatedBy = req.user._id;
     await settings.save();
     return res.json(paymentSettingsResponse(settings));
@@ -1111,9 +1131,19 @@ const deletePaymentAccount = async (req, res, next) => {
   try {
     const settings = await getEditablePaymentSettings();
     const account = settings.accounts.id(req.params.id);
-    if (!account) return res.status(404).json({ status: 'error', message: 'Payment account not found.' });
+    const legacyAccount = legacyPaymentAccounts(settings)
+      .find((candidate) => candidate.id === req.params.id);
+    if (!account && !legacyAccount) {
+      return res.status(404).json({ status: 'error', message: 'Payment account not found.' });
+    }
 
-    account.deleteOne();
+    if (account) account.deleteOne();
+    if (isLegacyPaymentAccountId(req.params.id)) {
+      settings.deletedPaymentAccounts = [...new Set([
+        ...(settings.deletedPaymentAccounts || []),
+        req.params.id,
+      ])];
+    }
     settings.updatedBy = req.user._id;
     await settings.save();
     return res.json(paymentSettingsResponse(settings));
