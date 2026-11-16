@@ -306,3 +306,38 @@ git push origin feature-auth
    * `VITE_CAD_PER_USD`: `1.423964` (Canadian dollars per US dollar)
    * `VITE_MXN_PER_USD`: `18.62736` (Mexican pesos per US dollar)
 5. Click **Deploy**.
+---
+
+---
+
+## Screenshots
+
+### 1. Homepage
+![AllStore Homepage](docs/screenshots/homepage.png)
+
+### 2. Product Catalog
+![Product Catalog](docs/screenshots/product-catalog.png)
+
+### 3. Product Details
+![Product Details](docs/screenshots/product-details.png)
+
+### 4. Shopping Cart
+![Shopping Cart](docs/screenshots/shopping-cart.png)
+
+### 5. Checkout
+![Checkout](docs/screenshots/checkout.png)
+
+### 6. Customer Orders
+![Customer Orders](docs/screenshots/customer-orders.png)
+
+### 7. Admin Dashboard
+![Admin Dashboard](docs/screenshots/admin-dashboard.png)
+
+### 8. Admin Product Management
+![Admin Product Management](docs/screenshots/admin-products.png)
+
+### 9. Admin Order Management
+![Admin Order Management](docs/screenshots/admin-orders.png)
+
+### 10. Payment Management
+![Payment Management](docs/screenshots/payment-management.png)
